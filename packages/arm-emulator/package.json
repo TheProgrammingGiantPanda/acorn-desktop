@@ -1,5 +1,5 @@
 {
-  "name": "@acorn/arm-emulator",
+  "name": "@theprogramminggiantpanda/arm-emulator",
   "version": "0.1.0",
   "private": true,
   "main": "./dist/index.js",
@@ -14,10 +14,10 @@
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "clean": "rimraf dist",
-    "test": "node --experimental-vm-modules node_modules/.bin/jest"
+    "test": "vitest run"
   },
   "dependencies": {
-    "@acorn/shared": "workspace:*"
+    "@theprogramminggiantpanda/shared": "workspace:*"
   },
   "devDependencies": {
     "rimraf": "^5.0.5",

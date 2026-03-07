@@ -15,6 +15,9 @@
 import { RegisterFile, Mode, PC_MASK, IRQ_MASK_BIT, FIQ_MASK_BIT } from "./registers.js";
 import type { SystemBus } from "../memory/bus.js";
 
+/** A SWI handler receives the live register file and system bus. */
+export type SwiHandler = (regs: RegisterFile, bus: SystemBus) => void;
+
 /** Exception vector addresses (ARM2 standard) */
 const VECTOR_RESET   = 0x00000000;
 const VECTOR_UNDEF   = 0x00000004;
@@ -83,6 +86,8 @@ export type CpuVariant = "ARM2" | "ARM3";
 export class ARM2CPU {
   readonly regs = new RegisterFile();
   private halted = false;
+  /** Set to true when an instruction explicitly writes the PC (branch/exception). */
+  private pcExplicit = false;
   /** Total executed instruction count */
   cycleCount = 0;
 
@@ -92,18 +97,15 @@ export class ARM2CPU {
   ) {}
 
   reset(): void {
-    this.regs.reset();
+    this.regs.reset(); // PC = 0, Supervisor mode, IRQ+FIQ disabled
     this.halted = false;
     this.cycleCount = 0;
-    // Jump through reset vector
-    const vec = this.bus.read32(VECTOR_RESET);
-    this.regs.pc = vec & PC_MASK;
   }
 
   /** Execute up to `count` instructions. Returns actual count executed. */
   step(count: number): number {
     let executed = 0;
-    while (executed < count && !this.halted) {
+    while (executed < count && !this.halted && !this.swiPending) {
       this.executeOne();
       executed++;
       this.cycleCount++;
@@ -112,17 +114,16 @@ export class ARM2CPU {
   }
 
   private executeOne(): void {
-    const pc = this.regs.pc;
-    const instr = this.bus.read32(pc);
+    const instrAddr = this.regs.pc;
+    const instr     = this.bus.read32(instrAddr);
 
-    // Advance PC before execution (ARM pipeline: fetch+decode+execute)
-    this.regs.advancePC();
-    this.regs.advancePC(); // +8 total (two stages ahead)
+    // ARM 3-stage pipeline: R15 reads as instrAddr+8 during instruction execution
+    this.regs.pc = (instrAddr + 8) & PC_MASK;
+    this.pcExplicit = false;
 
     const cond = (instr >>> 28) & 0xF;
     if (!conditionMet(cond, this.regs)) {
-      // Condition not met — back up the extra advance
-      this.regs.pc = (pc + 4) & PC_MASK;
+      this.regs.pc = (instrAddr + 4) & PC_MASK;
       return;
     }
 
@@ -138,7 +139,6 @@ export class ARM2CPU {
       const bit4  = (instr >>> 4) & 1;
       const bit7  = (instr >>> 7) & 1;
       if (!bit25 && bit7 && bit4 && ((instr >>> 22) & 0xF) === 0) {
-        // Multiply / Multiply-Accumulate
         this.execMultiply(instr);
       } else {
         this.execDataProcessing(instr);
@@ -152,14 +152,13 @@ export class ARM2CPU {
         this.execBlockTransfer(instr);
       }
     } else {
-      // Coprocessor / undefined
       this.takeException(VECTOR_UNDEF, Mode.Supervisor);
     }
 
-    // Restore correct PC (we advanced by 8 for pipeline simulation; real PC tracks fetch)
-    // The PC visible to instructions should be pc+8, which is what we set; correct to pc+4
-    // after execution unless the instruction modified PC itself.
-    // (Handled by each exec method writing r15 directly when needed)
+    // Only advance to the next instruction if nothing explicitly wrote the PC.
+    if (!this.pcExplicit) {
+      this.regs.pc = (instrAddr + 4) & PC_MASK;
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -241,6 +240,7 @@ export class ARM2CPU {
       this.regs.write(Rd, result);
     } else if (writeResult && Rd === 15) {
       this.regs.r15 = result >>> 0;
+      this.pcExplicit = true;
     }
   }
 
@@ -310,7 +310,7 @@ export class ARM2CPU {
 
     if (L) {
       const val = B ? this.bus.read8(addr) : this.bus.read32(addr);
-      if (Rd === 15) this.regs.r15 = val >>> 0;
+      if (Rd === 15) { this.regs.r15 = val >>> 0; this.pcExplicit = true; }
       else this.regs.write(Rd, val);
     } else {
       const val = this.regs.read(Rd) >>> 0;
@@ -331,30 +331,36 @@ export class ARM2CPU {
     const L    = (instr >>> 20) & 1;
     const W    = (instr >>> 21) & 1;
     const S    = (instr >>> 22) & 1; // user-mode registers / PSR restore
-    const U    = (instr >>> 23) & 1; // 1=increment
-    const P    = (instr >>> 24) & 1; // 1=pre
+    const U    = (instr >>> 23) & 1; // 1=increment, 0=decrement
+    const P    = (instr >>> 24) & 1; // 1=pre (before), 0=post (after)
     const Rn   = (instr >>> 16) & 0xF;
     const rlist = instr & 0xFFFF;
 
-    let base = this.regs.read(Rn) >>> 0;
+    const base  = this.regs.read(Rn) >>> 0;
     const count = popcount(rlist);
-    const start = U ? base : (base - count * 4) >>> 0;
 
-    let addr = start;
-    if (!U) addr = (base - count * 4) >>> 0;
+    // All four addressing modes (IA/IB/DA/DB) can be reduced to:
+    // compute the lowest address used, then step upward by 4 per register.
+    // Registers are always transferred in order from lowest to highest bit index.
+    let lowestAddr: number;
+    if (U) {
+      lowestAddr = P ? (base + 4) >>> 0 : base; // IB / IA
+    } else {
+      lowestAddr = P ? (base - count * 4) >>> 0 : (base - count * 4 + 4) >>> 0; // DB / DA
+    }
 
+    let pos = 0;
     for (let i = 0; i < 16; i++) {
       if (!(rlist & (1 << i))) continue;
-      const effective = P ? (addr + (U ? 0 : 4)) >>> 0 : addr;
-
+      const addr = (lowestAddr + pos * 4) >>> 0;
       if (L) {
-        const val = this.bus.read32(effective);
-        if (i === 15) this.regs.r15 = val >>> 0;
+        const val = this.bus.read32(addr);
+        if (i === 15) { this.regs.r15 = val >>> 0; this.pcExplicit = true; }
         else           this.regs.write(i, val);
       } else {
-        this.bus.write32(effective, this.regs.read(i));
+        this.bus.write32(addr, this.regs.read(i));
       }
-      addr = (addr + (U ? 4 : -4)) >>> 0;
+      pos++;
     }
 
     if (W) {
@@ -372,24 +378,50 @@ export class ARM2CPU {
   // ---------------------------------------------------------------------------
   private execBranch(instr: number): void {
     const L    = (instr >>> 24) & 1;
-    // 24-bit signed offset, shifted left 2
+    // 24-bit signed offset, shifted left 2, sign-extended from bit 25
     let offset = (instr & 0x00FF_FFFF) << 2;
-    // Sign-extend from bit 25
     if (offset & 0x0200_0000) offset |= 0xFC00_0000;
 
-    const pc = this.regs.pc; // already at PC+8 (pipeline)
+    // this.regs.pc is instrAddr+8 (set by executeOne before dispatch)
+    const pipelinePC = this.regs.pc;
     if (L) {
-      // Save return address (PC+4 from instruction) into R14
-      this.regs.write(14, (pc - 4) | (this.regs.r15 & ~PC_MASK));
+      // LR = address of instruction after the branch (instrAddr+4)
+      this.regs.write(14, (pipelinePC - 4) | (this.regs.r15 & ~PC_MASK));
     }
-    this.regs.pc = ((pc - 8) + 8 + offset) & PC_MASK; // relative to instr+8
+    // Branch target = instrAddr+8 + offset (ARM spec: relative to pipeline PC)
+    this.regs.pc = (pipelinePC + offset) & PC_MASK;
+    this.pcExplicit = true;
   }
 
   // ---------------------------------------------------------------------------
-  // SWI
+  // SWI dispatch
   // ---------------------------------------------------------------------------
-  private execSWI(_instr: number): void {
-    this.takeException(VECTOR_SWI, Mode.Supervisor);
+  /**
+   * Registered SWI handlers.  If a handler is present for a given SWI number
+   * it is called instead of vectoring to the ROM exception handler.
+   *
+   * Handlers receive the current registers, may modify them (results go back
+   * into the register file), and may be async – in which case they should
+   * set `this.swiPending = true` and resolve via `resumeFromSWI()`.
+   */
+  readonly swiHandlers = new Map<number, SwiHandler>();
+
+  /** True while waiting for an async SWI (e.g. Wimp_Poll) to complete */
+  swiPending = false;
+
+  private execSWI(instr: number): void {
+    const swiNum = instr & 0x00FF_FFFF;
+    const handler = this.swiHandlers.get(swiNum);
+    if (handler) {
+      handler(this.regs, this.bus);
+    } else {
+      this.takeException(VECTOR_SWI, Mode.Supervisor);
+    }
+  }
+
+  /** Resume after an async SWI completes (called externally) */
+  resumeFromSWI(): void {
+    this.swiPending = false;
   }
 
   // ---------------------------------------------------------------------------
@@ -402,6 +434,7 @@ export class ARM2CPU {
     this.regs.write(14, retAddr);
     this.regs.r15 = (this.regs.r15 & ~PC_MASK) | (vector & PC_MASK) | IRQ_MASK_BIT;
     if (newMode === Mode.FIQ) this.regs.r15 |= FIQ_MASK_BIT;
+    this.pcExplicit = true;
   }
 
   triggerIRQ(): void {

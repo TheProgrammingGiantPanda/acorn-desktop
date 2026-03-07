@@ -1,157 +1,129 @@
 /**
  * Archimedes Machine
  *
- * Top-level emulator that wires together CPU, chips, and bus.
- * Runs the emulation loop and produces video frames.
+ * Wires together the CPU, RAM, ROM, and system bus.
+ * Video output and window management are handled externally via SWI handlers
+ * registered by the risc-os package — the machine itself has no display.
  */
 
-import { ARM2CPU, type CpuVariant } from "./cpu/arm2.js";
+import { ARM2CPU, type SwiHandler, type CpuVariant } from "./cpu/arm2.js";
 import { SystemBus } from "./memory/bus.js";
-import { VIDC } from "./chips/vidc.js";
 import { MEMC } from "./chips/memc.js";
 import { IOC }  from "./chips/ioc.js";
-import type { MachineConfig } from "@acorn/shared";
+import type { MachineConfig } from "@theprogramminggiantpanda/shared";
 
-/** Archimedes base clock frequencies */
-const ARM2_CLOCK_HZ = 8_000_000;  // 8 MHz
-const ARM3_CLOCK_HZ = 25_000_000; // 25 MHz
-
-/** Target frame rate */
-const TARGET_FPS = 50; // PAL
-
-export interface FrameCallback {
-  (pixels: Uint8ClampedArray, width: number, height: number): void;
-}
+const ARM2_CLOCK_HZ = 8_000_000;
+const ARM3_CLOCK_HZ = 25_000_000;
+const STEPS_PER_TICK = 10_000; // instructions per setTimeout slice
 
 export class ArchimedesMachine {
   readonly cpu: ARM2CPU;
   readonly bus: SystemBus;
-  readonly vidc: VIDC;
   readonly memc: MEMC;
-  readonly ioc: IOC;
+  readonly ioc:  IOC;
 
-  private frameBuffer: Uint8ClampedArray;
-  private running = false;
-  private paused  = false;
-  private frameCallback?: FrameCallback;
+  private running  = false;
+  private paused   = false;
+  private tickHandle: ReturnType<typeof setTimeout> | null = null;
 
-  /** Measured performance */
-  fps = 0;
   mhz = 0;
-
-  private lastFrameTime = 0;
-  private frameCount = 0;
+  private cycleSnapshot = 0;
+  private lastMeasure   = 0;
 
   constructor(private readonly config: MachineConfig) {
-    this.vidc = new VIDC();
     this.memc = new MEMC();
     this.ioc  = new IOC();
-    this.bus  = new SystemBus(config.ramSize, this.vidc, this.memc, this.ioc);
-    this.cpu  = new ARM2CPU(this.bus, config.cpuVariant as CpuVariant);
 
-    // Wire IOC interrupts to CPU
+    // VIDC stub — satisfies bus constructor but does nothing (no hardware rendering)
+    const vidcStub = {
+      write: () => {},
+      displayWidth:  640,
+      displayHeight: 512,
+      bpp:           4 as 4,
+      renderFrame:   () => {},
+    } as unknown as import("./chips/vidc.js").VIDC;
+
+    this.bus = new SystemBus(config.ramSize, vidcStub, this.memc, this.ioc);
+    this.cpu = new ARM2CPU(this.bus, config.cpuVariant as CpuVariant);
+
     this.ioc.onIRQ = () => this.cpu.triggerIRQ();
     this.ioc.onFIQ = () => this.cpu.triggerFIQ();
-
-    // Initial frame buffer (will be resized on first frame)
-    this.frameBuffer = new Uint8ClampedArray(640 * 512 * 4);
   }
 
   loadROM(data: Uint8Array): void {
     this.bus.loadROM(data);
   }
 
-  onFrame(cb: FrameCallback): void {
-    this.frameCallback = cb;
+  /** Register a SWI handler by SWI number */
+  registerSWI(swiNum: number, handler: SwiHandler): void {
+    this.cpu.swiHandlers.set(swiNum, handler);
+  }
+
+  /** Register multiple SWI handlers at once */
+  registerSWIs(handlers: Record<number, SwiHandler>): void {
+    for (const [num, handler] of Object.entries(handlers)) {
+      this.cpu.swiHandlers.set(Number(num), handler);
+    }
   }
 
   reset(): void {
     this.memc.reset();
     this.ioc.reset();
     this.cpu.reset();
-    this.frameCount = 0;
-    this.lastFrameTime = Date.now();
+    this.cycleSnapshot = 0;
+    this.lastMeasure   = Date.now();
   }
-
-  pause(): void  { this.paused = true; }
-  resume(): void { this.paused = false; }
 
   start(): void {
     this.running = true;
     this.paused  = false;
     this.reset();
-    this.runLoop();
+    this.scheduleTick();
   }
 
   stop(): void {
     this.running = false;
-  }
-
-  private runLoop(): void {
-    if (!this.running) return;
-
-    const clockHz = (this.config.cpuVariant === "ARM3" ? ARM3_CLOCK_HZ : ARM2_CLOCK_HZ)
-                    * this.config.speedMultiplier;
-    const cyclesPerFrame = Math.floor(clockHz / TARGET_FPS);
-
-    const tick = () => {
-      if (!this.running) return;
-      if (!this.paused) {
-        this.executeFrame(cyclesPerFrame);
-      }
-      // Schedule next frame (use setImmediate/setTimeout in Node, requestAnimationFrame in renderer)
-      if (typeof requestAnimationFrame !== "undefined") {
-        requestAnimationFrame(tick);
-      } else {
-        setImmediate(tick);
-      }
-    };
-
-    if (typeof requestAnimationFrame !== "undefined") {
-      requestAnimationFrame(tick);
-    } else {
-      setImmediate(tick);
+    if (this.tickHandle !== null) {
+      clearTimeout(this.tickHandle);
+      this.tickHandle = null;
     }
   }
 
-  private executeFrame(cycles: number): void {
-    // Run CPU for one frame worth of cycles
-    this.cpu.step(cycles);
+  pause():  void { this.paused = true; }
+  resume(): void { this.paused = false; }
 
-    // IOC timer tick (~20ms per frame at 50Hz)
-    this.ioc.tick(1_000_000 / TARGET_FPS);
+  /** Called externally when an async SWI (e.g. Wimp_Poll) completes */
+  wakeFromSWI(): void {
+    this.cpu.resumeFromSWI();
+    if (this.running && !this.paused) this.scheduleTick();
+  }
 
-    // Render frame via VIDC
-    const w = this.vidc.displayWidth;
-    const h = this.vidc.displayHeight;
-    const needed = w * h * 4;
-    if (this.frameBuffer.length !== needed) {
-      this.frameBuffer = new Uint8ClampedArray(needed);
-    }
+  private scheduleTick(): void {
+    this.tickHandle = setTimeout(() => this.tick(), 0);
+  }
 
-    if (this.memc.videoDMAEnabled) {
-      const screenRAM = this.bus.dmaRead(
-        this.memc.videoDMAStart,
-        Math.ceil((w * h * this.vidc.bpp) / 8)
-      );
-      this.vidc.renderFrame(screenRAM, this.frameBuffer);
-    }
+  private tick(): void {
+    if (!this.running || this.paused) return;
 
-    // Signal VBL to IOC
-    this.ioc.vblank();
+    const clockHz  = (this.config.cpuVariant === "ARM3" ? ARM3_CLOCK_HZ : ARM2_CLOCK_HZ)
+                     * this.config.speedMultiplier;
+    const steps    = this.config.speedMultiplier === 0
+      ? STEPS_PER_TICK * 10   // uncapped
+      : STEPS_PER_TICK;
 
-    this.frameCallback?.(this.frameBuffer, w, h);
+    this.cpu.step(steps);
+    this.ioc.tick(Math.floor((steps / clockHz) * 1_000_000));
 
-    // FPS counter
-    this.frameCount++;
+    // MHz measurement
     const now = Date.now();
-    const elapsed = now - this.lastFrameTime;
-    if (elapsed >= 1000) {
-      this.fps = Math.round((this.frameCount * 1000) / elapsed);
-      this.mhz = parseFloat(((this.cpu.cycleCount / elapsed) / 1000).toFixed(1));
-      this.frameCount = 0;
-      this.cpu.cycleCount = 0;
-      this.lastFrameTime = now;
+    if (now - this.lastMeasure >= 1000) {
+      const delta = this.cpu.cycleCount - this.cycleSnapshot;
+      this.mhz = parseFloat((delta / 1_000_000).toFixed(2));
+      this.cycleSnapshot = this.cpu.cycleCount;
+      this.lastMeasure   = now;
     }
+
+    // Keep looping unless a SWI put the CPU into pending state
+    if (!this.cpu.swiPending) this.scheduleTick();
   }
 }

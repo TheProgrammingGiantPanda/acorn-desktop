@@ -1,0 +1,120 @@
+/**
+ * RISC OS SWI numbers
+ * All values are the raw 24-bit SWI number encoded in the instruction.
+ */
+
+// OS kernel SWIs
+export const OS_WriteC       = 0x000000;
+export const OS_Write0       = 0x000002;
+export const OS_NewLine      = 0x000003;
+export const OS_ReadC        = 0x000004;
+export const OS_CLI          = 0x000005;
+export const OS_Byte         = 0x000006;
+export const OS_Word         = 0x000007;
+export const OS_File         = 0x000008;
+export const OS_Args         = 0x000009;
+export const OS_BGet         = 0x00000A;
+export const OS_BPut         = 0x00000B;
+export const OS_GBPB         = 0x00000C;
+export const OS_Find         = 0x00000D;
+export const OS_ReadLine     = 0x00000E;
+export const OS_Control      = 0x00000F;
+export const OS_GetEnv       = 0x000010;
+export const OS_Exit         = 0x000011;
+export const OS_IntOn        = 0x000013;
+export const OS_IntOff       = 0x000014;
+export const OS_FSControl    = 0x000019;
+export const OS_Heap         = 0x00001D;
+export const OS_Module       = 0x00001E;
+export const OS_Mouse        = 0x0000033;
+export const OS_Plot         = 0x000045;
+export const OS_WriteN       = 0x000046;
+export const OS_AddToVector  = 0x000047;
+export const OS_ReadModeVar  = 0x000035;
+export const OS_ReadVduVariables = 0x000031;
+export const OS_SetVduVariable  = 0x000032;
+export const OS_SWINumberToString = 0x000039;
+export const OS_SWINumberFromString = 0x00003A;
+export const OS_ReadUnsignedInt = 0x00003B;
+export const OS_ValidateAddress = 0x000003A;
+export const OS_CallASWI     = 0x00006F;
+export const OS_CallASWIR12  = 0x000071;
+export const OS_PlatformFeatures = 0x06D;
+
+// Wimp SWIs
+export const Wimp_Initialise      = 0x400C0;
+export const Wimp_CreateWindow    = 0x400C1;
+export const Wimp_CreateIcon      = 0x400C2;
+export const Wimp_DeleteWindow    = 0x400C3;
+export const Wimp_DeleteIcon      = 0x400C4;
+export const Wimp_OpenWindow      = 0x400C5;
+export const Wimp_CloseWindow     = 0x400C6;
+export const Wimp_Poll            = 0x400C7;
+export const Wimp_RedrawWindow    = 0x400C8;
+export const Wimp_UpdateWindow    = 0x400C9;
+export const Wimp_GetRectangle    = 0x400CA;
+export const Wimp_GetWindowState  = 0x400CB;
+export const Wimp_GetWindowInfo   = 0x400CC;
+export const Wimp_SetIconState    = 0x400CD;
+export const Wimp_GetIconState    = 0x400CE;
+export const Wimp_GetPointerInfo  = 0x400CF;
+export const Wimp_DragBox         = 0x400D0;
+export const Wimp_ForceRedraw     = 0x400D1;
+export const Wimp_SetCaretPosition = 0x400D2;
+export const Wimp_GetCaretPosition = 0x400D3;
+export const Wimp_CreateMenu      = 0x400D4;
+export const Wimp_DecodeMenu      = 0x400D5;
+export const Wimp_WhichIcon       = 0x400D6;
+export const Wimp_SetExtent       = 0x400D7;
+export const Wimp_SetPointerShape = 0x400D8;
+export const Wimp_OpenTemplate    = 0x400D9;
+export const Wimp_CloseTemplate   = 0x400DA;
+export const Wimp_LoadTemplate    = 0x400DB;
+export const Wimp_ProcessKey      = 0x400DC;
+export const Wimp_CloseDown       = 0x400DD;
+export const Wimp_StartTask       = 0x400DE;
+export const Wimp_ReportError     = 0x400DF;
+export const Wimp_GetWindowOutline = 0x400E0;
+export const Wimp_PollIdle        = 0x400E1;
+export const Wimp_PlotIcon        = 0x400E2;
+export const Wimp_SetMode         = 0x400E3;
+export const Wimp_SendMessage     = 0x400E7;
+export const Wimp_CreateSubMenu   = 0x400E8;
+export const Wimp_SpriteOp        = 0x400E9;
+export const Wimp_SlotSize        = 0x400EC;
+export const Wimp_ReadSysInfo     = 0x400F2;
+export const Wimp_SetFontColours  = 0x400F3;
+export const Wimp_GetMenuState    = 0x400F4;
+export const Wimp_TextColour      = 0x400F0;
+
+// Draw SWIs
+export const Draw_ProcessPath     = 0x040740;
+export const Draw_FlattenPath     = 0x040741;
+export const Draw_TransformPath   = 0x040742;
+export const Draw_StrokePath      = 0x040743;
+export const Draw_FillNonZero     = 0x040744;
+export const Draw_Stroke          = 0x040745;
+export const Draw_FlattenAndStroke = 0x040746;
+export const Draw_ProcessAndStroke = 0x040747;
+
+// Font SWIs
+export const Font_CacheAddr       = 0x040080;
+export const Font_FindFont        = 0x040081;
+export const Font_LoseFont        = 0x040082;
+export const Font_ReadDefn        = 0x040083;
+export const Font_ReadInfo        = 0x040084;
+export const Font_StringWidth     = 0x040085;
+export const Font_Paint           = 0x040086;
+export const Font_Caret           = 0x040087;
+export const Font_ConverttoOS     = 0x040088;
+export const Font_Converttopoints = 0x040089;
+export const Font_SetFont         = 0x04008A;
+export const Font_CurrentFont     = 0x04008B;
+export const Font_FutureFont      = 0x04008C;
+export const Font_FindCaret       = 0x04008D;
+export const Font_CharBBox        = 0x04008E;
+export const Font_ReadScaleFactor = 0x04008F;
+export const Font_SetScaleFactor  = 0x040090;
+export const Font_ListFonts       = 0x040091;
+export const Font_SetFontColours  = 0x040092;
+export const Font_SetPalette      = 0x040093;

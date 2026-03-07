@@ -6,7 +6,9 @@
     "outDir": "./dist",
     "rootDir": "./src",
     "paths": {
-      "@acorn/shared": ["../shared/dist/index.d.ts"]
+      "@theprogramminggiantpanda/shared":        ["../shared/dist/index.d.ts"],
+      "@theprogramminggiantpanda/arm-emulator":  ["../arm-emulator/dist/index.d.ts"],
+      "@theprogramminggiantpanda/risc-os":       ["../risc-os/dist/index.d.ts"]
     }
   },
   "include": ["src/main", "src/preload"]

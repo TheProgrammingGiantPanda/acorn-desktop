@@ -8,12 +8,16 @@ export default defineConfig({
     outDir: path.join(__dirname, "dist/renderer"),
     emptyOutDir: true,
     rollupOptions: {
-      input: path.join(__dirname, "src/renderer/index.html"),
+      input: {
+        index:   path.join(__dirname, "src/renderer/index.html"),
+        window:  path.join(__dirname, "src/renderer/window.html"),
+        iconbar: path.join(__dirname, "src/renderer/iconbar.html"),
+      },
     },
   },
   resolve: {
     alias: {
-      "@acorn/shared": path.join(__dirname, "../shared/src/index.ts"),
+      "@theprogramminggiantpanda/shared": path.join(__dirname, "../shared/src/index.ts"),
     },
   },
 });

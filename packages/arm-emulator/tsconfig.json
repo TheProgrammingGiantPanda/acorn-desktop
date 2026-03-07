@@ -6,7 +6,7 @@
     "rootDir": "./src",
     "lib": ["ES2022", "DOM"],
     "paths": {
-      "@acorn/shared": ["../shared/src/index.ts"]
+      "@theprogramminggiantpanda/shared": ["../shared/src/index.ts"]
     }
   },
   "include": ["src"],

@@ -52,13 +52,13 @@ export class MEMC {
         this.control = value;
         break;
       case 0x04:
-        this.videoDMAStart = value & 0x01FF_FFFC;
+        this.videoDMAStart = value & 0x03FF_FFFC;
         break;
       case 0x08:
-        this.videoDMAEnd = value & 0x01FF_FFFC;
+        this.videoDMAEnd = value & 0x03FF_FFFC;
         break;
       case 0x0C:
-        this.soundDMAStart = value & 0x01FF_FFFC;
+        this.soundDMAStart = value & 0x03FF_FFFC;
         break;
     }
   }

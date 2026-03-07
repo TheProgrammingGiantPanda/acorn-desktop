@@ -1,121 +1,160 @@
 /**
- * Electron main process entry point
+ * Electron main process
+ *
+ * Starts the ARM emulator + RISC OS SWI layer.
+ * Each RISC OS program window becomes a real native BrowserWindow.
  */
+
 import { app, BrowserWindow, ipcMain, Menu, dialog } from "electron";
 import path from "path";
 import fs from "fs";
-import { buildMenu } from "./menu.js";
-import { IPC } from "@acorn/shared";
-import type { RomLoadedPayload, DiskLoadedPayload } from "@acorn/shared";
+import { ArchimedesMachine } from "@theprogramminggiantpanda/arm-emulator";
+import { SwiDispatcher } from "@theprogramminggiantpanda/risc-os";
+import { NativeWimpHost } from "./native-wimp-host.js";
+import { NodeFsHost } from "./node-fs-host.js";
+import { buildAppMenu } from "./menu.js";
+import type { MachineConfig } from "@theprogramminggiantpanda/shared";
+import { IPC } from "@theprogramminggiantpanda/shared";
 
 const isDev = !app.isPackaged;
 
-let mainWindow: BrowserWindow | null = null;
+let machine:    ArchimedesMachine | null = null;
+let dispatcher: SwiDispatcher    | null = null;
+let wimpHost:   NativeWimpHost   | null = null;
 
-function createWindow(): BrowserWindow {
+const defaultConfig: MachineConfig = {
+  model:           "A310",
+  ramSize:         1 * 1024 * 1024,
+  cpuVariant:      "ARM2",
+  speedMultiplier: 1.0,
+};
+let config: MachineConfig = { ...defaultConfig };
+
+// ---------------------------------------------------------------------------
+// Launcher window (ROM picker + status)
+// ---------------------------------------------------------------------------
+function createLauncherWindow(): BrowserWindow {
   const win = new BrowserWindow({
-    width: 800,
-    height: 640,
-    minWidth: 640,
-    minHeight: 520,
-    title: "Acorn Desktop",
-    backgroundColor: "#1a1a1a",
+    width:  560,
+    height: 360,
+    title:  "Acorn Desktop",
+    resizable: false,
     webPreferences: {
       preload: path.join(__dirname, "../preload/index.js"),
       contextIsolation: true,
       nodeIntegration: false,
-      sandbox: false,
     },
-    // Show native frame with title bar
-    frame: true,
-    show: false,
   });
 
-  // Build and apply native menu
-  const menu = buildMenu(win);
-  Menu.setApplicationMenu(menu);
-
-  // Load renderer
   if (isDev) {
-    win.loadURL("http://localhost:5173");
-    win.webContents.openDevTools();
+    win.loadURL("http://localhost:5173/index.html");
+    win.webContents.openDevTools({ mode: "detach" });
   } else {
-    win.loadFile(path.join(__dirname, "../renderer/index.html"));
+    win.loadFile(path.join(__dirname, "../../renderer/index.html"));
   }
 
-  win.once("ready-to-show", () => win.show());
-
-  win.on("closed", () => { mainWindow = null; });
-
+  Menu.setApplicationMenu(buildAppMenu(win, { onLoadROM, onReset, onSetSpeed, onSetCPU }));
   return win;
 }
 
-// ---------------------------------------------------------------------------
-// IPC handlers (renderer → main)
-// ---------------------------------------------------------------------------
+let launcherWindow: BrowserWindow | null = null;
 
-/** Load ROM file and send its contents to renderer */
-ipcMain.handle(IPC.LOAD_ROM, async (_event, payload: { path: string }) => {
-  try {
-    const data = fs.readFileSync(payload.path);
-    const result: RomLoadedPayload = { path: payload.path, sizeBytes: data.length };
-    mainWindow?.webContents.send(IPC.ROM_LOADED, result, data.buffer);
-    return { ok: true };
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    mainWindow?.webContents.send(IPC.ERROR, { message: msg, fatal: false });
-    return { ok: false, error: msg };
-  }
-});
+// ---------------------------------------------------------------------------
+// Machine lifecycle
+// ---------------------------------------------------------------------------
+function startMachine(romData: Uint8Array): void {
+  machine?.stop();
 
-/** Load disk image and send its contents to renderer */
-ipcMain.handle(IPC.LOAD_DISK, async (_event, payload: { path: string }) => {
+  const fsRoot = path.join(app.getPath("documents"), "RISCOS");
+  machine    = new ArchimedesMachine(config);
+  wimpHost   = new NativeWimpHost();
+  dispatcher = new SwiDispatcher(machine, wimpHost, {
+    onOutput: (text) => launcherWindow?.webContents.send("console-output", text),
+    fs: new NodeFsHost(fsRoot),
+  });
+
+  machine.loadROM(romData);
+  machine.start();
+
+  launcherWindow?.webContents.send("machine-started", { model: config.model });
+}
+
+// ---------------------------------------------------------------------------
+// IPC handlers
+// ---------------------------------------------------------------------------
+async function onLoadROM(): Promise<void> {
+  if (!launcherWindow) return;
+  const result = await dialog.showOpenDialog(launcherWindow, {
+    title: "Load RISC OS ROM",
+    filters: [
+      { name: "ROM Images", extensions: ["rom", "bin", "img"] },
+      { name: "All Files",  extensions: ["*"] },
+    ],
+    properties: ["openFile"],
+  });
+  if (result.canceled || !result.filePaths[0]) return;
   try {
-    const data = fs.readFileSync(payload.path);
-    const result: DiskLoadedPayload = {
-      path: payload.path,
-      name: path.basename(payload.path),
+    const data = fs.readFileSync(result.filePaths[0]);
+    startMachine(new Uint8Array(data));
+    launcherWindow?.webContents.send(IPC.ROM_LOADED, {
+      path: result.filePaths[0],
       sizeBytes: data.length,
-    };
-    mainWindow?.webContents.send(IPC.DISK_LOADED, result, data.buffer);
-    return { ok: true };
+    });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    mainWindow?.webContents.send(IPC.ERROR, { message: msg, fatal: false });
-    return { ok: false, error: msg };
+    launcherWindow?.webContents.send(IPC.ERROR, { message: msg, fatal: false });
+  }
+}
+
+function onReset(): void {
+  machine?.reset();
+}
+
+function onSetSpeed(mult: number): void {
+  config = { ...config, speedMultiplier: mult };
+}
+
+function onSetCPU(variant: "ARM2" | "ARM3"): void {
+  config = { ...config, cpuVariant: variant };
+}
+
+// Drag-and-drop from renderer
+ipcMain.handle(IPC.DRAG_FILE, async (_ev, filePath: string) => {
+  if (!fs.existsSync(filePath)) return;
+  const ext = path.extname(filePath).toLowerCase();
+  if ([".rom", ".bin", ".img"].includes(ext)) {
+    const data = fs.readFileSync(filePath);
+    startMachine(new Uint8Array(data));
   }
 });
 
-/** Handle drag-and-drop file from renderer */
-ipcMain.handle(IPC.DRAG_FILE, async (_event, filePath: string) => {
-  if (!fs.existsSync(filePath)) return { ok: false, error: "File not found" };
-  const ext = path.extname(filePath).toLowerCase();
-  const romExts    = [".rom", ".bin", ".img", ".arc"];
-  const diskExts   = [".adf", ".adl", ".hdf", ".vhd"];
-
-  if (romExts.includes(ext)) {
-    return ipcMain.emit(IPC.LOAD_ROM, null, { path: filePath });
+ipcMain.handle(IPC.LOAD_ROM,  async (_ev, payload: { path: string }) => {
+  try {
+    const data = fs.readFileSync(payload.path);
+    startMachine(new Uint8Array(data));
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: String(err) };
   }
-  if (diskExts.includes(ext)) {
-    return ipcMain.emit(IPC.LOAD_DISK, null, { path: filePath });
-  }
-  return { ok: false, error: `Unknown file type: ${ext}` };
 });
 
 // ---------------------------------------------------------------------------
 // App lifecycle
 // ---------------------------------------------------------------------------
-
 app.whenReady().then(() => {
-  mainWindow = createWindow();
+  launcherWindow = createLauncherWindow();
+  launcherWindow.on("closed", () => { launcherWindow = null; });
 
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) {
-      mainWindow = createWindow();
+      launcherWindow = createLauncherWindow();
     }
   });
 });
 
 app.on("window-all-closed", () => {
-  if (process.platform !== "darwin") app.quit();
+  if (process.platform !== "darwin") {
+    machine?.stop();
+    app.quit();
+  }
 });

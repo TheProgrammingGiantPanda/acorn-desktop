@@ -62,6 +62,14 @@ export class SystemBus {
     if (this.romActive && aligned < this.rom.length) {
       return this.readROM32(aligned);
     }
+    // Peripheral regions must be checked before the broad ROM window (0x3400-0x37FF)
+    // because MEMC (0x36E0), VIDC (0x3500), and IOC (0x3200) all fall within it.
+    if (aligned >= IOC_BASE && aligned <= IOC_END) {
+      return this.ioc.read(aligned - IOC_BASE);
+    }
+    if (aligned >= MEMC_BASE && aligned <= MEMC_END) {
+      return this.memc.readControl(aligned - MEMC_BASE);
+    }
     if (aligned >= ROM_BASE && aligned <= ROM_END) {
       return this.readROM32(aligned - ROM_BASE);
     }
@@ -71,12 +79,6 @@ export class SystemBus {
     if (aligned < this.ram.length) {
       // Logical RAM (simplified — MEMC translation omitted)
       return this.readRAM32(aligned);
-    }
-    if (aligned >= IOC_BASE && aligned <= IOC_END) {
-      return this.ioc.read(aligned - IOC_BASE);
-    }
-    if (aligned >= MEMC_BASE && aligned <= MEMC_END) {
-      return this.memc.readControl(aligned - MEMC_BASE);
     }
     return 0xDEAD_BEEF; // open bus
   }
@@ -152,11 +154,20 @@ export class SystemBus {
             (this.rom[offset + 3]! << 24)) >>> 0;
   }
 
-  /** Direct RAM access for DMA (e.g. VIDC DMA) */
+  /** Direct RAM read for DMA (e.g. VIDC DMA) */
   dmaRead(physAddr: number, length: number): Uint8Array {
     const offset = physAddr >= PHYS_RAM_BASE
       ? physAddr - PHYS_RAM_BASE
       : physAddr;
     return this.ram.subarray(offset, offset + length);
+  }
+
+  /** Direct RAM write for DMA (e.g. file load) */
+  dmaWrite(physAddr: number, data: Uint8Array): void {
+    const offset = physAddr >= PHYS_RAM_BASE
+      ? physAddr - PHYS_RAM_BASE
+      : physAddr;
+    const end = Math.min(offset + data.length, this.ram.length);
+    this.ram.set(data.subarray(0, end - offset), offset);
   }
 }

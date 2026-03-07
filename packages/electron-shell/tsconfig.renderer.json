@@ -8,8 +8,9 @@
     "rootDir": "./src/renderer",
     "noEmit": true,
     "paths": {
-      "@acorn/shared":        ["../shared/dist/index.d.ts"],
-      "@acorn/arm-emulator":  ["../arm-emulator/dist/index.d.ts"]
+      "@theprogramminggiantpanda/shared":        ["../shared/dist/index.d.ts"],
+      "@theprogramminggiantpanda/arm-emulator":  ["../arm-emulator/dist/index.d.ts"],
+      "@theprogramminggiantpanda/risc-os":       ["../risc-os/dist/index.d.ts"]
     }
   },
   "include": ["src/renderer"]

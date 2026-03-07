@@ -1,0 +1,18 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "composite": true,
+    "outDir": "./dist",
+    "rootDir": "./src",
+    "lib": ["ES2022"],
+    "paths": {
+      "@theprogramminggiantpanda/shared":       ["../shared/src/index.ts"],
+      "@theprogramminggiantpanda/arm-emulator": ["../arm-emulator/src/index.ts"]
+    }
+  },
+  "include": ["src"],
+  "references": [
+    { "path": "../shared" },
+    { "path": "../arm-emulator" }
+  ]
+}
