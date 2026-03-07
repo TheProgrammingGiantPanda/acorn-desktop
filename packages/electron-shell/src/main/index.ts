@@ -22,6 +22,15 @@ let machine:    ArchimedesMachine | null = null;
 let dispatcher: SwiDispatcher    | null = null;
 let wimpHost:   NativeWimpHost   | null = null;
 
+// ---------------------------------------------------------------------------
+// CLI argument: first non-flag positional arg after the Electron app path
+// e.g.  electron . ./assets/programs/!Paint
+// ---------------------------------------------------------------------------
+function parseAppArg(): string | undefined {
+  // process.argv: [electron-binary, app-entry, ...user-args]
+  return process.argv.slice(2).find(a => !a.startsWith("-"));
+}
+
 const defaultConfig: MachineConfig = {
   model:           "A310",
   ramSize:         1 * 1024 * 1024,
@@ -62,21 +71,95 @@ let launcherWindow: BrowserWindow | null = null;
 // ---------------------------------------------------------------------------
 // Machine lifecycle
 // ---------------------------------------------------------------------------
-function startMachine(romData: Uint8Array): void {
+function startMachine(romData: Uint8Array, appHostPath?: string): void {
   machine?.stop();
 
-  const fsRoot = path.join(app.getPath("documents"), "RISCOS");
+  // When launching a specific app, root the FS at the app's parent directory
+  // so the app dir is accessible as $.!AppName inside RISC OS.
+  // Otherwise use the standard ~/Documents/RISCOS root.
+  const fsRoot = appHostPath
+    ? path.dirname(path.resolve(appHostPath))
+    : path.join(app.getPath("documents"), "RISCOS");
+
+  const nodeFs = new NodeFsHost(fsRoot);
+
   machine    = new ArchimedesMachine(config);
   wimpHost   = new NativeWimpHost();
   dispatcher = new SwiDispatcher(machine, wimpHost, {
     onOutput: (text) => launcherWindow?.webContents.send("console-output", text),
-    fs: new NodeFsHost(fsRoot),
+    fs: nodeFs,
+    onRunBinary: (riscosPath) => {
+      try {
+        const data = nodeFs.readFile(riscosPath);
+        machine!.loadProgram(data);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        launcherWindow?.webContents.send(IPC.ERROR, { message: `Cannot run ${riscosPath}: ${msg}`, fatal: false });
+      }
+    },
   });
 
   machine.loadROM(romData);
   machine.start();
 
+  if (appHostPath) {
+    launchApp(nodeFs, appHostPath);
+  }
+
   launcherWindow?.webContents.send("machine-started", { model: config.model });
+}
+
+// ---------------------------------------------------------------------------
+// App launch (CLI)
+// ---------------------------------------------------------------------------
+function launchApp(nodeFs: NodeFsHost, hostPath: string): void {
+  const resolved = path.resolve(hostPath);
+
+  if (!fs.existsSync(resolved)) {
+    launcherWindow?.webContents.send(IPC.ERROR, {
+      message: `App path not found: ${hostPath}`,
+      fatal: false,
+    });
+    return;
+  }
+
+  const stat = fs.statSync(resolved);
+
+  if (stat.isDirectory()) {
+    const appName   = path.basename(resolved);          // e.g. "!Paint"
+
+    if (!appName.startsWith("!")) {
+      launcherWindow?.webContents.send(IPC.ERROR, {
+        message: `App directory name must start with '!': ${appName}`,
+        fatal: false,
+      });
+      return;
+    }
+
+    const runScript = `$.${appName}.!Run`;              // e.g. "$.!Paint.!Run"
+    const runHost   = path.join(resolved, "!Run");
+
+    if (fs.existsSync(runHost)) {
+      // Normal RISC OS app: run the !Run Obey script
+      dispatcher!.obey.runFile(runScript);
+    } else {
+      // No !Run — try !RunImage as a raw binary
+      const runImageHost = path.join(resolved, "!RunImage");
+      if (fs.existsSync(runImageHost)) {
+        const data = fs.readFileSync(runImageHost);
+        machine!.loadProgram(new Uint8Array(data));
+      } else {
+        launcherWindow?.webContents.send(IPC.ERROR, {
+          message: `No !Run or !RunImage found in: ${hostPath}`,
+          fatal: false,
+        });
+      }
+    }
+  } else {
+    // Raw binary file — load it directly at 0x8000
+    const data = fs.readFileSync(resolved);
+    machine!.loadProgram(new Uint8Array(data));
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -161,7 +244,7 @@ function tryAutoLoadROM(): void {
 
   try {
     const data = fs.readFileSync(path.join(romsDir, romFile));
-    startMachine(new Uint8Array(data));
+    startMachine(new Uint8Array(data), parseAppArg());
     launcherWindow?.webContents.send(IPC.ROM_LOADED, {
       path: path.join(romsDir, romFile),
       sizeBytes: data.length,

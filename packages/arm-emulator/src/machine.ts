@@ -54,6 +54,33 @@ export class ArchimedesMachine {
     this.bus.loadROM(data);
   }
 
+  /**
+   * Load an ARM binary into logical RAM and prepare the CPU to run it.
+   *
+   * Releases the ROM alias (making logical RAM visible at address 0), writes
+   * the binary at `addr` (default 0x8000), and plants an unconditional branch
+   * at address 0 so the CPU jumps there on its first instruction fetch.
+   *
+   * Must be called after `start()` but before the first CPU tick executes
+   * (i.e. synchronously, since ticks are scheduled via setTimeout).
+   */
+  loadProgram(data: Uint8Array, addr = 0x8000): void {
+    this.bus.releaseROMAlias();
+
+    // ARM branch encoding: 0xEA000000 | signed_offset_words
+    // offset = (target - (PC + 8)) / 4; at address 0, PC+8 = 8
+    const offset = ((addr - 8) >>> 2) & 0x00FF_FFFF;
+    const branch = (0xEA00_0000 | offset) >>> 0;
+    this.bus.dmaWrite(0, new Uint8Array([
+      branch         & 0xFF,
+      (branch >>>  8) & 0xFF,
+      (branch >>> 16) & 0xFF,
+      (branch >>> 24) & 0xFF,
+    ]));
+
+    this.bus.dmaWrite(addr, data);
+  }
+
   /** Register a SWI handler by SWI number */
   registerSWI(swiNum: number, handler: SwiHandler): void {
     this.cpu.swiHandlers.set(swiNum, handler);
