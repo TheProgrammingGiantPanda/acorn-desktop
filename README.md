@@ -136,6 +136,39 @@ No VIDC pixel rendering takes place. Instead:
 - Mouse clicks and key presses in a `BrowserWindow` are sent via IPC to the main process and delivered to the emulated CPU as Wimp events
 - The iconbar is a persistent, frameless, always-on-bottom `BrowserWindow`
 
+### Boot sequence
+
+On startup, the emulator scans `assets/programs/` for RISC OS application directories (names beginning with `!`) and boots them in alphabetical order, mirroring the behaviour of the RISC OS Filer when it first opens a directory:
+
+1. If the app has a `!Boot` Obey script, it is executed. This sets system variables (e.g. `AppName$Dir`, `AppName$Path`), registers file type associations, and loads the app's sprites.
+2. If the app has no `!Boot` but has a `!Sprites` file, the sprites are loaded directly.
+
+Variables set during boot (e.g. `File$Type_FCA`) remain live for the duration of the session and are visible to any subsequently launched application.
+
+### Sprites
+
+RISC OS sprite files (`.!Sprites`) are parsed and decoded at boot time by `SpritePool` in `packages/risc-os/src/sprite/sprite-pool.ts`.
+
+**File format:**
+
+Sprite files omit the first "area size" word that is present in memory-resident sprite areas. All stored offsets are therefore 4 bytes larger than their file-relative positions.
+
+| Region | Layout |
+|---|---|
+| Area header | 3 words: num_sprites, first_sprite_mem_offset, free_mem_offset |
+| Per-sprite header | 44 bytes: next_offset, name (12 b), width_words−1, height−1, lbit, rbit, img_offset, mask_offset, mode |
+| Palette (optional) | Between byte 44 and img_offset; 8 bytes per entry (two flash-colour words) |
+| Image data | Packed LSB-first; `lbit` leading bits per row are padding |
+| Mask data | 1 bit per pixel, same row width (in words) as image; 1 = opaque |
+
+Colour words use the format: bits 8–15 = red, 16–23 = green, 24–31 = blue.
+
+Default palettes are provided for 1, 2, 4, and 8 bpp modes. An embedded palette in the sprite overrides the default.
+
+**Path-variable resolution:**
+
+The Obey `IconSprites` command supports the RISC OS path-variable syntax (`AppName:filename`). `AppName:` is expanded to the value of the `AppName$Path` system variable before the file is read.
+
 ### File system
 
 File I/O SWIs are forwarded to the host OS via a `FileSystemHost` interface. The default implementation (`NodeFsHost`) uses synchronous Node.js `fs` APIs, mirroring the blocking behaviour of real Archimedes hardware.
@@ -209,6 +242,8 @@ acorn-desktop/
 │   │       │   ├── event-queue.ts   # Wimp event queue
 │   │       │   ├── native-host.ts   # NativeHost interface
 │   │       │   └── types.ts         # Wimp types and constants
+│   │       ├── sprite/
+│   │       │   └── sprite-pool.ts   # RISC OS sprite area parser + decoded pool
 │   │       └── swi-numbers.ts    # SWI number constants
 │   └── electron-shell/
 │       └── src/

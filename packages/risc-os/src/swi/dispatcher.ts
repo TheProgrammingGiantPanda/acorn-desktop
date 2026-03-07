@@ -13,6 +13,7 @@ import { OSFileHandler } from "../fs/os-fs.js";
 import { makeOSHandlers, type OutputCallback } from "./os-core.js";
 import { SystemVariables, type VarType } from "../sysvar/sysvar.js";
 import { ObeyInterpreter } from "../obey/obey.js";
+import { SpritePool } from "../sprite/sprite-pool.js";
 import * as SWI from "../swi-numbers.js";
 
 export interface DispatcherOptions {
@@ -25,21 +26,24 @@ export interface DispatcherOptions {
 }
 
 export class SwiDispatcher {
-  readonly wimp:   WimpManager;
-  readonly sysvar: SystemVariables;
-  readonly obey:   ObeyInterpreter;
+  readonly wimp:        WimpManager;
+  readonly sysvar:      SystemVariables;
+  readonly obey:        ObeyInterpreter;
+  readonly spritePool:  SpritePool;
 
   constructor(
     private readonly machine: ArchimedesMachine,
     host: NativeHost,
     options: DispatcherOptions = {},
   ) {
-    this.wimp   = new WimpManager(host);
+    this.wimp       = new WimpManager(host);
     this.wimp.setMachine(machine);
-    this.sysvar = new SystemVariables();
-    this.obey   = new ObeyInterpreter(options.fs, this.sysvar, {
+    this.sysvar     = new SystemVariables();
+    this.spritePool = new SpritePool();
+    this.obey       = new ObeyInterpreter(options.fs, this.sysvar, {
       onOutput:    options.onOutput,
       onRunBinary: options.onRunBinary,
+      spritePool:  this.spritePool,
     });
     this.registerAll(options.onOutput ?? (() => {}), options.fs);
   }
