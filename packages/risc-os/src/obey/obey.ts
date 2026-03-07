@@ -1,0 +1,209 @@
+/**
+ * RISC OS Obey script interpreter
+ *
+ * Obey files are simple line-by-line CLI scripts used in !Run and !Boot.
+ * Each line is a CLI command; '|' begins a comment.
+ *
+ * Commands handled:
+ *   Set / SetMacro / Unset     — system variable management
+ *   Run <path>                 — run an Obey file or ARM binary
+ *   RMLoad <path>              — load a relocatable module (stub)
+ *   RMEnsure <n> <v> [<cmd>]  — ensure module version present (stub)
+ *   WimpSlot [-min n] [-max n] — set Wimp slot size (stub)
+ *   If <cond> Then <c> [Else <c>] — conditional
+ *   Error [<n>] <msg>          — report error
+ *   Echo <text>                — print text
+ *   IconSprites <path>         — load app sprites (stub)
+ *   | <comment>                — ignored
+ */
+
+import type { FileSystemHost } from '../fs/fs-host.js';
+import type { SystemVariables } from '../sysvar/sysvar.js';
+
+export interface ObeyOptions {
+  onOutput?:    (text: string) => void;
+  /** Called when Run targets an ARM binary (not an Obey file). */
+  onRunBinary?: (riscosPath: string) => void;
+}
+
+export class ObeyInterpreter {
+  private readonly output:    (text: string) => void;
+  private readonly runBinary: (path: string) => void;
+
+  constructor(
+    private readonly fs:     FileSystemHost | undefined,
+    private readonly sysvar: SystemVariables,
+    options: ObeyOptions = {},
+  ) {
+    this.output    = options.onOutput    ?? (() => {});
+    this.runBinary = options.onRunBinary ?? (() => {});
+  }
+
+  // ── Public API ─────────────────────────────────────────────────────────────
+
+  /** Read an Obey file from the RISC OS filesystem and execute it. */
+  runFile(riscosPath: string): void {
+    if (!this.fs) {
+      this.output(`Obey: no filesystem — cannot read ${riscosPath}\r\n`);
+      return;
+    }
+
+    let content: Uint8Array;
+    try {
+      content = this.fs.readFile(riscosPath);
+    } catch {
+      this.output(`Obey: cannot read ${riscosPath}\r\n`);
+      return;
+    }
+
+    const dir = parentDir(riscosPath);
+    const saved = this.sysvar.get('Obey$Dir');
+    this.sysvar.set('Obey$Dir', dir);
+    try {
+      const text = new TextDecoder().decode(content);
+      for (const rawLine of text.split(/\r?\n/)) {
+        this.executeLine(rawLine.trimEnd());
+      }
+    } finally {
+      if (saved !== undefined) this.sysvar.set('Obey$Dir', saved);
+      else                      this.sysvar.unset('Obey$Dir');
+    }
+  }
+
+  /** Execute a single CLI command string (e.g. from OS_CLI or a line of !Run). */
+  executeLine(raw: string): void {
+    // Expand system variable references first
+    const line = this.sysvar.substitute(raw).trimStart();
+    if (!line || line.startsWith('|')) return;
+
+    const [cmd, rest] = splitFirst(line);
+    switch (cmd.toUpperCase()) {
+      case 'SET':         this.cmdSet(rest, 'string'); break;
+      case 'SETMACRO':    this.cmdSet(rest, 'macro');  break;
+      case 'UNSET':       this.sysvar.unset(rest.trim()); break;
+      case 'RUN':         this.cmdRun(rest.trim()); break;
+      case 'RMLOAD':      this.cmdRMLoad(rest.trim()); break;
+      case 'RMENSURE':    this.cmdRMEnsure(rest.trim()); break;
+      case 'WIMPSLOT':    /* stub — slot sizing handled by Wimp */ break;
+      case 'IF':          this.cmdIf(rest); break;
+      case 'ERROR':       this.cmdError(rest.trim()); break;
+      case 'ECHO':        this.output(rest.trim() + '\r\n'); break;
+      case 'ICONSPRITES': /* stub — sprites rendered later */ break;
+      default:
+        // Bare path or unrecognised command: treat as Run
+        this.cmdRun(line);
+        break;
+    }
+  }
+
+  // ── Command implementations ─────────────────────────────────────────────────
+
+  private cmdSet(args: string, type: 'string' | 'macro'): void {
+    // Set <name> <value>
+    const m = args.trimStart().match(/^(\S+)\s*(.*)/s);
+    if (!m) return;
+    this.sysvar.set(m[1]!, m[2]?.trimEnd() ?? '', type);
+  }
+
+  private cmdRun(path: string): void {
+    if (!path) return;
+
+    if (!this.fs) {
+      this.runBinary(path);
+      return;
+    }
+
+    let content: Uint8Array | null = null;
+    try { content = this.fs.readFile(path); } catch { /* not found or binary */ }
+
+    if (content && looksLikeObey(content)) {
+      this.runFile(path);
+    } else {
+      this.runBinary(path);
+    }
+  }
+
+  private cmdRMLoad(path: string): void {
+    // Stub: log and succeed. Real implementation: issue #3.
+    this.output(`RMLoad: ${path} (not yet implemented)\r\n`);
+  }
+
+  private cmdRMEnsure(args: string): void {
+    // RMEnsure <ModuleName> <MinVersion> [<FallbackCommand>]
+    const m = args.match(/^(\S+)\s+(\S+)(?:\s+(.*))?$/s);
+    if (!m) return;
+    // Stub: module not loaded → run fallback command if provided
+    const fallback = m[3]?.trim();
+    if (fallback) this.executeLine(fallback);
+  }
+
+  private cmdIf(args: string): void {
+    // If <cond> Then <thenCmd> [Else <elseCmd>]
+    const m = args.match(/^(.*?)\s+Then\s+(.*?)(?:\s+Else\s+(.*))?$/is);
+    if (!m) return;
+    const cond    = m[1]!.trim();
+    const thenCmd = m[2]!.trim();
+    const elseCmd = m[3]?.trim();
+
+    if (evalCond(cond)) {
+      this.executeLine(thenCmd);
+    } else if (elseCmd) {
+      this.executeLine(elseCmd);
+    }
+  }
+
+  private cmdError(args: string): void {
+    // Error [<num>] <message>
+    const m = args.match(/^(\d+)\s+(.*)$/s);
+    const msg = m ? m[2]! : args;
+    this.output(`Error: ${msg}\r\n`);
+  }
+}
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+/** Split "WORD rest" on the first whitespace boundary. */
+function splitFirst(line: string): [string, string] {
+  const i = line.search(/\s/);
+  if (i === -1) return [line, ''];
+  return [line.slice(0, i), line.slice(i)];
+}
+
+/** Parent directory of a RISC OS path (e.g. "$.Apps.!Paint.!Run" → "$.Apps.!Paint"). */
+function parentDir(riscosPath: string): string {
+  const i = riscosPath.lastIndexOf('.');
+  return i > 0 ? riscosPath.slice(0, i) : '$';
+}
+
+/**
+ * Heuristic: does the file content look like an Obey script rather than an ARM binary?
+ * Obey files always begin with printable ASCII; ARM binaries begin with an instruction word.
+ */
+function looksLikeObey(data: Uint8Array): boolean {
+  // Skip leading CR/LF/space
+  let i = 0;
+  while (i < data.length && (data[i] === 0x0D || data[i] === 0x0A || data[i] === 0x20)) i++;
+  if (i >= data.length) return false;
+
+  const first = data[i]!;
+  // '|' — Obey comment character
+  if (first === 0x7C) return true;
+
+  // Check for a leading keyword
+  const snippet = new TextDecoder().decode(data.subarray(i, Math.min(i + 16, data.length))).toUpperCase();
+  return /^(SET|SETMACRO|UNSET|RUN|RMLOAD|RMENSURE|WIMPSLOT|IF|ERROR|ECHO|ICONSPRITES)\b/.test(snippet);
+}
+
+/** Evaluate a simple Obey If condition. */
+function evalCond(cond: string): boolean {
+  // "val1" = "val2"
+  const eqMatch = cond.match(/^"(.*)"\s*=\s*"(.*)"$/s);
+  if (eqMatch) return eqMatch[1] === eqMatch[2];
+
+  // Single quoted string: true if non-empty
+  const strMatch = cond.match(/^"(.*)"$/s);
+  if (strMatch) return strMatch[1]!.length > 0;
+
+  // Bare value: true if non-empty and not "0"
+  return cond.length > 0 && cond !== '0';
+}

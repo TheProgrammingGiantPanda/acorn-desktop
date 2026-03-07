@@ -11,6 +11,8 @@ import type { FileSystemHost } from "../fs/fs-host.js";
 import { WimpManager } from "../wimp/wimp-manager.js";
 import { OSFileHandler } from "../fs/os-fs.js";
 import { makeOSHandlers, type OutputCallback } from "./os-core.js";
+import { SystemVariables, type VarType } from "../sysvar/sysvar.js";
+import { ObeyInterpreter } from "../obey/obey.js";
 import * as SWI from "../swi-numbers.js";
 
 export interface DispatcherOptions {
@@ -18,18 +20,27 @@ export interface DispatcherOptions {
   onOutput?: OutputCallback;
   /** If provided, OS file-system SWIs (OS_File, OS_Find, etc.) are active */
   fs?: FileSystemHost;
+  /** Called when an Obey Run command targets an ARM binary */
+  onRunBinary?: (riscosPath: string) => void;
 }
 
 export class SwiDispatcher {
-  readonly wimp: WimpManager;
+  readonly wimp:   WimpManager;
+  readonly sysvar: SystemVariables;
+  readonly obey:   ObeyInterpreter;
 
   constructor(
     private readonly machine: ArchimedesMachine,
     host: NativeHost,
     options: DispatcherOptions = {},
   ) {
-    this.wimp = new WimpManager(host);
+    this.wimp   = new WimpManager(host);
     this.wimp.setMachine(machine);
+    this.sysvar = new SystemVariables();
+    this.obey   = new ObeyInterpreter(options.fs, this.sysvar, {
+      onOutput:    options.onOutput,
+      onRunBinary: options.onRunBinary,
+    });
     this.registerAll(options.onOutput ?? (() => {}), options.fs);
   }
 
@@ -52,6 +63,60 @@ export class SwiDispatcher {
     cpu.swiHandlers.set(SWI.OS_Heap,         os.OS_Heap);
     cpu.swiHandlers.set(SWI.OS_Module,       os.OS_Module);
     cpu.swiHandlers.set(SWI.OS_WriteN,       os.OS_WriteN);
+
+    // ── System variables ──────────────────────────────────────────────────────
+    const { sysvar, obey } = this;
+
+    cpu.swiHandlers.set(SWI.OS_CLI, (regs, bus) => {
+      const cmd = readCString(bus, regs.read(0));
+      obey.executeLine(cmd);
+    });
+
+    cpu.swiHandlers.set(SWI.OS_ReadVarVal, (regs, bus) => {
+      const name  = readCString(bus, regs.read(0));
+      const bufAddr = regs.read(1);
+      const bufLen  = regs.read(2);
+      const value = sysvar.get(name);
+      if (value === undefined) {
+        regs.C = true;
+        regs.write(2, -1 >>> 0);
+        return;
+      }
+      const bytes = new TextEncoder().encode(value);
+      if (bufLen > 0) {
+        const n = Math.min(bytes.length, bufLen);
+        for (let i = 0; i < n; i++) bus.write8(bufAddr + i, bytes[i]!);
+        regs.write(2, n);
+      } else {
+        // R2=0: caller just wants the length
+        regs.write(2, bytes.length);
+      }
+      regs.C = false;
+    });
+
+    cpu.swiHandlers.set(SWI.OS_SetVarVal, (regs, bus) => {
+      const name    = readCString(bus, regs.read(0));
+      const valAddr = regs.read(1);
+      const valLen  = regs.read(2) | 0; // signed
+      const type    = regs.read(4);
+
+      if (valAddr === 0 || valLen < 0) {
+        sysvar.unset(name);
+        return;
+      }
+
+      let value: string;
+      if (valLen === 0) {
+        value = readCString(bus, valAddr);
+      } else {
+        const bytes = new Uint8Array(valLen);
+        for (let i = 0; i < valLen; i++) bytes[i] = bus.read8(valAddr + i);
+        value = new TextDecoder().decode(bytes);
+      }
+
+      const varType: VarType = type === 2 ? 'macro' : type === 1 ? 'number' : 'string';
+      sysvar.set(name, value, varType);
+    });
 
     // ── Wimp ─────────────────────────────────────────────────────────────────
     const w = this.wimp;
@@ -139,4 +204,16 @@ export class SwiDispatcher {
   injectEvent(ev: Parameters<WimpManager["pushEvent"]>[0]): void {
     this.wimp.pushEvent(ev);
   }
+}
+
+// ── Module-level helpers ──────────────────────────────────────────────────────
+
+function readCString(bus: { read8(addr: number): number }, addr: number): string {
+  let s = "";
+  for (let i = 0; i < 4096; i++) {
+    const c = bus.read8(addr + i);
+    if (c === 0) break;
+    s += String.fromCharCode(c);
+  }
+  return s;
 }

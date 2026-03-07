@@ -1,5 +1,9 @@
 export { SwiDispatcher } from "./swi/dispatcher.js";
 export type { DispatcherOptions } from "./swi/dispatcher.js";
+export { SystemVariables } from "./sysvar/sysvar.js";
+export type { VarType } from "./sysvar/sysvar.js";
+export { ObeyInterpreter } from "./obey/obey.js";
+export type { ObeyOptions } from "./obey/obey.js";
 export type { FileSystemHost, DirEntry, ObjectType } from "./fs/fs-host.js";
 export { WimpManager } from "./wimp/wimp-manager.js";
 export { WimpEventQueue } from "./wimp/event-queue.js";
