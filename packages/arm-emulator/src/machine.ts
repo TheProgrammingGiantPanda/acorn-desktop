@@ -48,6 +48,7 @@ export class ArchimedesMachine {
 
     this.ioc.onIRQ = () => this.cpu.triggerIRQ();
     this.ioc.onFIQ = () => this.cpu.triggerFIQ();
+    this.bus.onDataAbort = () => this.cpu.triggerDataAbort();
   }
 
   loadROM(data: Uint8Array): void {

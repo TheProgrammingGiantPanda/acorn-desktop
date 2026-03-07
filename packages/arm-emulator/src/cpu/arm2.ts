@@ -448,6 +448,10 @@ export class ARM2CPU {
       this.takeException(VECTOR_FIQ, Mode.FIQ);
     }
   }
+
+  triggerDataAbort(): void {
+    this.takeException(VECTOR_DABORT, Mode.Supervisor);
+  }
 }
 
 function popcount(n: number): number {
