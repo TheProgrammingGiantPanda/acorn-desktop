@@ -1,0 +1,5 @@
+# Ignore all asset files but keep the README placeholders
+*
+!.gitignore
+!*/
+!*/README.md
