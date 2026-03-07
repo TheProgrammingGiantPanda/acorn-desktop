@@ -137,9 +137,8 @@ function launchApp(nodeFs: NodeFsHost, hostPath: string): void {
     }
 
     const runScript = `$.${appName}.!Run`;              // e.g. "$.!Paint.!Run"
-    const runHost   = path.join(resolved, "!Run");
 
-    if (fs.existsSync(runHost)) {
+    if (nodeFs.stat(runScript) !== null) {
       // Normal RISC OS app: run the !Run Obey script
       dispatcher!.obey.runFile(runScript);
     } else {
