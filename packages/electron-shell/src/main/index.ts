@@ -146,8 +146,7 @@ function launchApp(nodeFs: NodeFsHost, hostPath: string): void {
       // No !Run — try !RunImage as a raw binary
       const riscosRunImage = `$.${appName}.!RunImage`;
       if (nodeFs.stat(riscosRunImage) !== null) {
-        const data = nodeFs.readFile(riscosRunImage);
-        machine!.loadProgram(new Uint8Array(data));
+        machine!.loadProgram(nodeFs.readFile(riscosRunImage));
       } else {
         launcherWindow?.webContents.send(IPC.ERROR, {
           message: `No !Run or !RunImage found in: ${hostPath}`,
