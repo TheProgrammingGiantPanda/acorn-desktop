@@ -139,11 +139,49 @@ ipcMain.handle(IPC.LOAD_ROM,  async (_ev, payload: { path: string }) => {
 });
 
 // ---------------------------------------------------------------------------
+// Auto-load ROM from assets/roms/ on startup
+// ---------------------------------------------------------------------------
+function tryAutoLoadROM(): void {
+  const romsDir = path.join(app.getAppPath(), "assets", "roms");
+
+  let files: string[] = [];
+  try {
+    files = fs.readdirSync(romsDir);
+  } catch { /* directory missing — fall through to error */ }
+
+  const romFile = files.find(f => /\.(rom|bin|img)$/i.test(f));
+  if (!romFile) {
+    dialog.showErrorBox(
+      "No ROM found",
+      `Place a RISC OS ROM image (.rom, .bin, or .img) in:\n\n${romsDir}`,
+    );
+    app.quit();
+    return;
+  }
+
+  try {
+    const data = fs.readFileSync(path.join(romsDir, romFile));
+    startMachine(new Uint8Array(data));
+    launcherWindow?.webContents.send(IPC.ROM_LOADED, {
+      path: path.join(romsDir, romFile),
+      sizeBytes: data.length,
+    });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    dialog.showErrorBox("Failed to load ROM", msg);
+    app.quit();
+  }
+}
+
+// ---------------------------------------------------------------------------
 // App lifecycle
 // ---------------------------------------------------------------------------
 app.whenReady().then(() => {
   launcherWindow = createLauncherWindow();
   launcherWindow.on("closed", () => { launcherWindow = null; });
+
+  // Delay auto-load until the renderer is ready to receive IPC events
+  launcherWindow.webContents.once("did-finish-load", tryAutoLoadROM);
 
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) {
