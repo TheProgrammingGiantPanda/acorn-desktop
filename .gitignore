@@ -9,3 +9,5 @@ Thumbs.db
 *.adf
 *.adl
 *.vhd
+*.tsbuildinfo
+.claude/
