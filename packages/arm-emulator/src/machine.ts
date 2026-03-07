@@ -65,6 +65,7 @@ export class ArchimedesMachine {
    * (i.e. synchronously, since ticks are scheduled via setTimeout).
    */
   loadProgram(data: Uint8Array, addr = 0x8000): void {
+    if (addr < 8) throw new RangeError(`loadProgram: addr must be >= 8, got 0x${addr.toString(16)}`);
     this.bus.releaseROMAlias();
 
     // ARM branch encoding: 0xEA000000 | signed_offset_words

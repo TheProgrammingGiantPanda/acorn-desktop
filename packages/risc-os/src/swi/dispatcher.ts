@@ -123,9 +123,7 @@ export class SwiDispatcher {
 
     cpu.swiHandlers.set(SWI.Wimp_Initialise, (r, b) => w.initialise(r, b));
 
-    // Async Wimp calls: wrap in a fire-and-forget that suspends the CPU
-    const async_ = (fn: () => Promise<void>) => () => { void fn(); };
-
+    // Async Wimp calls: fire-and-forget, suspending the CPU until wakeFromSWI()
     cpu.swiHandlers.set(SWI.Wimp_CreateWindow,
       (r, b) => { m.cpu.swiPending = true; void w.createWindow(r, b).then(() => m.wakeFromSWI()); });
 
@@ -196,8 +194,6 @@ export class SwiDispatcher {
       cpu.swiHandlers.set(n, stub);
     }
 
-    // Suppress void from async_ usage warning
-    void async_;
   }
 
   /** Inject a Wimp event from the host (e.g. user clicked a button) */
