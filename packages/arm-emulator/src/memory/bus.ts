@@ -3,14 +3,15 @@
  *
  * Physical memory map (ARM2 physical addresses):
  *
- *   0x0000_0000 – 0x01FF_FFFF  Logical RAM (via MEMC)
+ *   0x0000_0000 – 0x01FF_FFFF  Logical RAM (MEMC CAM-translated)
  *   0x0200_0000 – 0x03FF_FFFF  Physical RAM (up to 4MB on A305/A310)
  *   0x0400_0000 – 0x1FFF_FFFF  (unmapped / expansion)
  *   0x2000_0000 – 0x27FF_FFFF  I/O (IOC) and Video (VIDC) registers
  *   0x3200_0000 – 0x3200_001F  IOC registers
  *   0x3500_0000 – 0x35FF_FFFF  VIDC write-only registers
- *   0x36E0_0000 – 0x36FF_FFFF  MEMC control registers
- *   0x3400_0000 – 0x37FF_FFFF  ROM (4 MB window)
+ *   0x3600_0000 – 0x37FF_FFFF  MEMC CAM write range
+ *     0x36E0_0000 – 0x36FF_FFFF  MEMC control registers (sub-range of CAM)
+ *   0x3400_0000 – 0x37FF_FFFF  ROM (4 MB window, read-only)
  *
  * At reset, ROM is also visible at 0x0000_0000 until MEMC releases.
  */
@@ -19,20 +20,26 @@ import type { VIDC } from "../chips/vidc.js";
 import type { MEMC } from "../chips/memc.js";
 import type { IOC }  from "../chips/ioc.js";
 
-const ROM_BASE   = 0x3400_0000;
-const ROM_END    = 0x37FF_FFFF;
-const VIDC_BASE  = 0x3500_0000;
-const VIDC_END   = 0x35FF_FFFF;
-const IOC_BASE   = 0x3200_0000;
-const IOC_END    = 0x323F_FFFF;
-const MEMC_BASE  = 0x36E0_0000;
-const MEMC_END   = 0x36FF_FFFF;
+const ROM_BASE      = 0x3400_0000;
+const ROM_END       = 0x37FF_FFFF;
+const VIDC_BASE     = 0x3500_0000;
+const VIDC_END      = 0x35FF_FFFF;
+const IOC_BASE      = 0x3200_0000;
+const IOC_END       = 0x323F_FFFF;
+const CAM_BASE      = 0x3600_0000;
+const CAM_END       = 0x37FF_FFFF;
+const MEMC_BASE     = 0x36E0_0000;
+const MEMC_END      = 0x36FF_FFFF;
 const PHYS_RAM_BASE = 0x0200_0000;
+const LOGICAL_END   = 0x01FF_FFFF;
 
 export class SystemBus {
   private ram: Uint8Array;
   private rom: Uint8Array;
   private romActive = true; // ROM mapped at 0 until MEMC releases
+
+  /** Called when a logical-address translation fault occurs (no CAM match). */
+  onDataAbort?: () => void;
 
   constructor(
     ramBytes: number,
@@ -76,9 +83,8 @@ export class SystemBus {
     if (aligned >= PHYS_RAM_BASE && aligned < PHYS_RAM_BASE + this.ram.length) {
       return this.readRAM32(aligned - PHYS_RAM_BASE);
     }
-    if (aligned < this.ram.length) {
-      // Logical RAM (simplified — MEMC translation omitted)
-      return this.readRAM32(aligned);
+    if (aligned <= LOGICAL_END) {
+      return this.readLogical(aligned);
     }
     return 0xDEAD_BEEF; // open bus
   }
@@ -91,8 +97,13 @@ export class SystemBus {
       this.vidc.write(value >>> 0);
       return;
     }
-    if (aligned >= MEMC_BASE && aligned <= MEMC_END) {
-      this.memc.writeControl(aligned - MEMC_BASE, value >>> 0);
+    // CAM range (0x3600_0000–0x37FF_FFFF) includes the MEMC control subrange.
+    if (aligned >= CAM_BASE && aligned <= CAM_END) {
+      if (aligned >= MEMC_BASE && aligned <= MEMC_END) {
+        this.memc.writeControl(aligned - MEMC_BASE, value >>> 0);
+      } else {
+        this.memc.writeCam(aligned - CAM_BASE);
+      }
       return;
     }
     if (aligned >= IOC_BASE && aligned <= IOC_END) {
@@ -103,8 +114,8 @@ export class SystemBus {
       this.writeRAM32(aligned - PHYS_RAM_BASE, value >>> 0);
       return;
     }
-    if (aligned < this.ram.length) {
-      this.writeRAM32(aligned, value >>> 0);
+    if (aligned <= LOGICAL_END) {
+      this.writeLogical(aligned, value >>> 0);
     }
     // ROM writes are ignored
   }
@@ -125,6 +136,27 @@ export class SystemBus {
     const shift = (addr & 3) * 8;
     const old = this.read32(aligned);
     this.write32(aligned, (old & ~(0xFF << shift)) | ((value & 0xFF) << shift));
+  }
+
+  // --------------------------------------------------------------------------
+  // Logical RAM (MEMC CAM-translated)
+  // --------------------------------------------------------------------------
+  private readLogical(logical: number): number {
+    const phys = this.memc.translateAddress(logical);
+    if (phys === null) {
+      this.onDataAbort?.();
+      return 0;
+    }
+    return this.readRAM32(phys - PHYS_RAM_BASE);
+  }
+
+  private writeLogical(logical: number, value: number): void {
+    const phys = this.memc.translateAddress(logical);
+    if (phys === null) {
+      this.onDataAbort?.();
+      return;
+    }
+    this.writeRAM32(phys - PHYS_RAM_BASE, value);
   }
 
   // --------------------------------------------------------------------------
