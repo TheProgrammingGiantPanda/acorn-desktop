@@ -177,21 +177,17 @@ function parentDir(riscosPath: string): string {
 
 /**
  * Heuristic: does the file content look like an Obey script rather than an ARM binary?
- * Obey files always begin with printable ASCII; ARM binaries begin with an instruction word.
+ * Obey scripts are plain ASCII text; ARM binaries will contain non-printable bytes.
  */
 function looksLikeObey(data: Uint8Array): boolean {
-  // Skip leading CR/LF/space
-  let i = 0;
-  while (i < data.length && (data[i] === 0x0D || data[i] === 0x0A || data[i] === 0x20)) i++;
-  if (i >= data.length) return false;
-
-  const first = data[i]!;
-  // '|' — Obey comment character
-  if (first === 0x7C) return true;
-
-  // Check for a leading keyword
-  const snippet = new TextDecoder().decode(data.subarray(i, Math.min(i + 16, data.length))).toUpperCase();
-  return /^(SET|SETMACRO|UNSET|RUN|RMLOAD|RMENSURE|WIMPSLOT|IF|ERROR|ECHO|ICONSPRITES)\b/.test(snippet);
+  if (data.length === 0) return false;
+  const limit = Math.min(data.length, 512);
+  for (let i = 0; i < limit; i++) {
+    const b = data[i]!;
+    // Allow printable ASCII, tab, LF, CR
+    if (b !== 0x09 && b !== 0x0A && b !== 0x0D && (b < 0x20 || b > 0x7E)) return false;
+  }
+  return true;
 }
 
 /** Evaluate a simple Obey If condition. */
