@@ -1,0 +1,20 @@
+{
+  "name": "acorn-desktop",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Acorn Archimedes emulator - runs RISC OS programs on Windows, Linux and macOS",
+  "scripts": {
+    "build": "pnpm -r run build",
+    "dev": "pnpm --filter electron-shell run dev",
+    "start": "pnpm --filter electron-shell run start",
+    "typecheck": "pnpm -r run typecheck",
+    "clean": "pnpm -r run clean"
+  },
+  "engines": {
+    "node": ">=18.0.0",
+    "pnpm": ">=8.0.0"
+  },
+  "pnpm": {
+    "allowBuild": ["electron", "esbuild"]
+  }
+}

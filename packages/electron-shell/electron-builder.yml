@@ -1,0 +1,32 @@
+appId: com.acorn.desktop
+productName: Acorn Desktop
+copyright: "Copyright 2024"
+
+directories:
+  output: release
+
+files:
+  - dist/**/*
+  - package.json
+
+win:
+  target:
+    - nsis
+  icon: assets/icon.ico
+
+mac:
+  target:
+    - dmg
+  icon: assets/icon.icns
+  category: public.app-category.games
+
+linux:
+  target:
+    - AppImage
+    - deb
+  icon: assets/icon.png
+  category: Game
+
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true

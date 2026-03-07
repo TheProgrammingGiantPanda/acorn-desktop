@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'" />
+  <title>Acorn Desktop</title>
+  <link rel="stylesheet" href="./style.css" />
+</head>
+<body>
+
+  <!-- Toolbar -->
+  <div id="toolbar" role="toolbar" aria-label="Emulator controls">
+
+    <button class="tb-btn" id="btn-load-rom"  title="Load ROM (Ctrl+O)">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <path d="M3 7h18M3 12h18M3 17h12"/><circle cx="19" cy="17" r="3"/>
+        <path d="M19 14v6M16 17h6"/>
+      </svg>
+      <span>ROM</span>
+    </button>
+
+    <button class="tb-btn" id="btn-load-disk" title="Load Disk (Ctrl+D)">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <ellipse cx="12" cy="12" rx="10" ry="10"/>
+        <ellipse cx="12" cy="12" rx="3" ry="3"/>
+        <path d="M12 2v3M12 19v3M2 12h3M19 12h3"/>
+      </svg>
+      <span>Disk</span>
+    </button>
+
+    <div class="tb-sep"></div>
+
+    <button class="tb-btn" id="btn-reset" title="Reset machine (F12)">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/>
+        <path d="M3 3v5h5"/>
+      </svg>
+      <span>Reset</span>
+    </button>
+
+    <button class="tb-btn" id="btn-pause" title="Pause / Resume (F11)">
+      <svg id="icon-pause" viewBox="0 0 24 24" fill="currentColor">
+        <rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/>
+      </svg>
+      <svg id="icon-play" viewBox="0 0 24 24" fill="currentColor" style="display:none">
+        <polygon points="5,3 19,12 5,21"/>
+      </svg>
+      <span id="pause-label">Pause</span>
+    </button>
+
+    <div class="tb-sep"></div>
+
+    <!-- Zoom selector -->
+    <label class="tb-label" for="zoom-select">Zoom</label>
+    <select id="zoom-select" class="tb-select" title="Display zoom">
+      <option value="1">1×</option>
+      <option value="2" selected>2×</option>
+      <option value="3">3×</option>
+      <option value="4">4×</option>
+    </select>
+
+    <div class="tb-sep"></div>
+
+    <!-- Status readout -->
+    <span class="tb-status" id="status-fps">-- fps</span>
+    <span class="tb-status" id="status-mhz">-- MHz</span>
+    <span class="tb-status" id="status-rom">No ROM</span>
+  </div>
+
+  <!-- Display area (drag & drop target) -->
+  <main id="display-area" class="drop-zone" aria-label="Emulator display">
+    <canvas id="screen" width="640" height="512" aria-label="Archimedes screen output"></canvas>
+    <div id="drop-overlay" aria-hidden="true">
+      <div class="drop-message">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+          <polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/>
+        </svg>
+        <p>Drop a ROM or disk image here</p>
+        <p class="drop-hint">.rom .bin .adf .adl .img</p>
+      </div>
+    </div>
+    <div id="no-rom-message">
+      <h2>Acorn Archimedes Emulator</h2>
+      <p>Load a RISC OS ROM to begin.</p>
+      <p>Use <strong>File → Load ROM</strong> or drop a file onto this window.</p>
+      <div class="model-badge">ARM2 / ARM3</div>
+    </div>
+  </main>
+
+  <!-- Status bar -->
+  <footer id="status-bar">
+    <span id="sb-model">A310</span>
+    <span id="sb-state">Ready</span>
+    <span id="sb-message"></span>
+  </footer>
+
+  <script type="module" src="./app.ts"></script>
+</body>
+</html>

@@ -1,0 +1,16 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "composite": true,
+    "outDir": "./dist",
+    "rootDir": "./src",
+    "lib": ["ES2022", "DOM"],
+    "paths": {
+      "@acorn/shared": ["../shared/src/index.ts"]
+    }
+  },
+  "include": ["src"],
+  "references": [
+    { "path": "../shared" }
+  ]
+}
