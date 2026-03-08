@@ -26,6 +26,44 @@ const SWI_OS_FSCONTROL = 0x19;
 // RISC OS file attributes: public-read | owner-read | owner-write
 const ATTR_DEFAULT = 0x03;
 
+// ---------------------------------------------------------------------------
+// File type helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Parse a RISC OS `,xyz` filetype suffix from a host filename.
+ * e.g. "Document,ffc" → { baseName: "Document", fileType: 0xFFC }
+ *      "!Run"         → { baseName: "!Run",      fileType: null }
+ */
+function parseTypeSuffix(hostName: string): { baseName: string; fileType: number | null } {
+  const match = /^(.+),([0-9a-fA-F]{3})$/.exec(hostName);
+  if (match) return { baseName: match[1]!, fileType: parseInt(match[2]!, 16) };
+  return { baseName: hostName, fileType: null };
+}
+
+/**
+ * Convert a host file's mtime (ms since 1970 Unix epoch) to the pair of
+ * words used in a RISC OS typed-file load/exec encoding:
+ *
+ *   load = 0xFFFtttHH  (ttt = 12-bit type, HH = top byte of 5-byte timestamp)
+ *   exec = LLLLLLLL    (low 4 bytes of the 5-byte centisecond timestamp)
+ *
+ * The RISC OS epoch is 1 January 1900; the timestamp is centiseconds.
+ */
+function makeLoadExec(fileType: number, mtimeMs: number): { load: number; exec: number } {
+  // Centiseconds from 1900-01-01 to 1970-01-01 (70 years + 17 leap days)
+  const EPOCH_OFFSET_CS = 220_898_880_000n;
+  const cs    = BigInt(Math.floor(mtimeMs / 10)) + EPOCH_OFFSET_CS;
+  const csHi  = Number((cs >> 32n) & 0xFFn);   // top byte of 5-byte stamp
+  const csLo  = Number(cs & 0xFFFF_FFFFn);       // lower 4 bytes
+  const load  = (0xFFF00000 | ((fileType & 0xFFF) << 8) | csHi) >>> 0;
+  return { load, exec: csLo >>> 0 };
+}
+
+/** Default load/exec for a file with no known type (untyped, no timestamp). */
+const UNTYPED_LOAD = 0xFFFFFFFF;
+const UNTYPED_EXEC = 0x00000000;
+
 interface HandleEntry {
   type:       "file" | "dir";
   nativePath: string;
@@ -45,23 +83,6 @@ export class HostFsHandler {
   // ---------------------------------------------------------------------------
   // Path translation
   // ---------------------------------------------------------------------------
-
-  /** Returns the native path for a "HostFS::" RISC OS path, or null if not ours. */
-  private toNative(riscosPath: string): string | null {
-    if (!riscosPath.toLowerCase().startsWith("hostfs::")) return null;
-    const inner = riscosPath.slice(8); // strip "HostFS::"
-    let relative: string;
-    if (inner === "$" || inner === "$.") {
-      relative = "";
-    } else if (inner.startsWith("$.")) {
-      // Replace RISC OS "." separator with native separator
-      relative = inner.slice(2).split(".").join(path.sep);
-    } else {
-      // No $ prefix — treat as relative to root
-      relative = inner.split(".").join(path.sep);
-    }
-    return path.join(this.root, relative);
-  }
 
   // ---------------------------------------------------------------------------
   // Helpers
@@ -99,6 +120,53 @@ export class HostFsHandler {
     return stat.isDirectory() ? 2 : 1;
   }
 
+  /**
+   * Resolve a RISC OS leaf name (no `,xyz` suffix) to the actual host filename
+   * inside `dir`.  If a file exists with a `,xyz` suffix it takes precedence;
+   * otherwise the bare name is returned (which may or may not exist).
+   */
+  private resolveLeaf(dir: string, riscosLeaf: string): string {
+    // Try exact match first (covers directories and untyped files)
+    const exact = path.join(dir, riscosLeaf);
+    try { fs.statSync(exact); return exact; } catch { /* try typed suffix */ }
+
+    // Scan directory for a file with the same base name + ,xyz suffix
+    try {
+      const entries = fs.readdirSync(dir);
+      const lowerLeaf = riscosLeaf.toLowerCase();
+      for (const entry of entries) {
+        const { baseName } = parseTypeSuffix(entry);
+        if (baseName.toLowerCase() === lowerLeaf) return path.join(dir, entry);
+      }
+    } catch { /* fall through */ }
+
+    return exact; // not found either way — return bare path (caller handles error)
+  }
+
+  /**
+   * Translate a RISC OS HostFS path to the actual native path, resolving each
+   * component through `resolveLeaf` so that `,xyz`-suffixed files are found
+   * transparently.
+   */
+  private toNativeResolved(riscosPath: string): string | null {
+    if (!riscosPath.toLowerCase().startsWith("hostfs::")) return null;
+    const inner = riscosPath.slice(8);
+    let components: string[];
+    if (inner === "$" || inner === "$.") {
+      return this.root;
+    } else if (inner.startsWith("$.")) {
+      components = inner.slice(2).split(".");
+    } else {
+      components = inner.split(".");
+    }
+
+    let current = this.root;
+    for (const comp of components) {
+      current = this.resolveLeaf(current, comp);
+    }
+    return current;
+  }
+
   // ---------------------------------------------------------------------------
   // OS_File (SWI 0x08)
   // ---------------------------------------------------------------------------
@@ -107,7 +175,7 @@ export class HostFsHandler {
     const reason   = regs.read(0);
     const pathAddr = regs.read(1) >>> 0;
     const riscPath = this.readString(bus, pathAddr);
-    const native   = this.toNative(riscPath);
+    const native   = this.toNativeResolved(riscPath);
     if (native === null) return "passthrough";
 
     regs.V = false;
@@ -116,9 +184,16 @@ export class HostFsHandler {
       case 5: { // Read catalogue info
         try {
           const stat = fs.statSync(native);
+          const { baseName: _, fileType } = parseTypeSuffix(path.basename(native));
+          let load: number, exec: number;
+          if (fileType !== null) {
+            ({ load, exec } = makeLoadExec(fileType, stat.mtimeMs));
+          } else {
+            load = UNTYPED_LOAD; exec = UNTYPED_EXEC;
+          }
           regs.write(0, this.statToType(stat)); // 1=file, 2=dir
-          regs.write(2, 0xFFFFFFFF);            // load addr (untyped)
-          regs.write(3, 0x00000000);            // exec addr
+          regs.write(2, load);
+          regs.write(3, exec);
           regs.write(4, stat.isFile() ? stat.size : 0);
           regs.write(5, ATTR_DEFAULT);
         } catch {
@@ -135,11 +210,19 @@ export class HostFsHandler {
       case 255: { // Load file to address in R2
         const destAddr = regs.read(2) >>> 0;
         try {
+          const stat = fs.statSync(native);
+          const { fileType } = parseTypeSuffix(path.basename(native));
+          let load: number, exec: number;
+          if (fileType !== null) {
+            ({ load, exec } = makeLoadExec(fileType, stat.mtimeMs));
+          } else {
+            load = UNTYPED_LOAD; exec = UNTYPED_EXEC;
+          }
           const data = fs.readFileSync(native);
           bus.dmaWrite(destAddr, data);
-          regs.write(0, 1);           // type = file
-          regs.write(2, destAddr);
-          regs.write(3, 0);
+          regs.write(0, 1);
+          regs.write(2, load);
+          regs.write(3, exec);
           regs.write(4, data.length);
           regs.write(5, ATTR_DEFAULT);
         } catch {
@@ -179,7 +262,7 @@ export class HostFsHandler {
     // Open: R0 bits[7:4]=mode (0x40=read, 0x80=write, 0xC0=update), R1=path
     const pathAddr = regs.read(1) >>> 0;
     const riscPath = this.readString(bus, pathAddr);
-    const native   = this.toNative(riscPath);
+    const native   = this.toNativeResolved(riscPath);
     if (native === null) return "passthrough";
 
     try {
@@ -230,7 +313,7 @@ export class HostFsHandler {
     if (reason >= 9 && reason <= 12) {
       const pathAddr = regs.read(1) >>> 0;
       const riscPath = this.readString(bus, pathAddr);
-      const native   = this.toNative(riscPath);
+      const native   = this.toNativeResolved(riscPath);
       if (native === null) return "passthrough";
 
       const bufAddr  = regs.read(2) >>> 0;
@@ -247,13 +330,16 @@ export class HostFsHandler {
       let idx     = startIdx;
 
       while (written < maxCount && idx < allEntries.length) {
-        const name      = allEntries[idx]!;
-        const entryPath = path.join(native, name);
+        const hostName  = allEntries[idx]!;
+        const entryPath = path.join(native, hostName);
         let stat: fs.Stats;
         try { stat = fs.statSync(entryPath); } catch { idx++; continue; }
 
+        // Strip ,xyz suffix — present the bare name to RISC OS
+        const { baseName, fileType } = parseTypeSuffix(hostName);
+
         // Calculate entry size before writing to check buffer bounds
-        const nameBytes = name.length + 1; // with null terminator
+        const nameBytes = baseName.length + 1; // with null terminator
         const namePad   = (nameBytes + 3) & ~3;
         const infoSize  = reason >= 10 ? 20 : 0; // 5 words of info for reasons 10+
         const entrySize = infoSize + namePad;
@@ -262,16 +348,22 @@ export class HostFsHandler {
 
         if (reason >= 10) {
           // Load addr, exec addr, size, attrs, type (5 words)
-          bus.write32(ptr,      0xFFFFFFFF);  // load addr (untyped)
-          bus.write32(ptr + 4,  0x00000000);  // exec addr
+          let load: number, exec: number;
+          if (fileType !== null) {
+            ({ load, exec } = makeLoadExec(fileType, stat.mtimeMs));
+          } else {
+            load = UNTYPED_LOAD; exec = UNTYPED_EXEC;
+          }
+          bus.write32(ptr,      load);
+          bus.write32(ptr + 4,  exec);
           bus.write32(ptr + 8,  stat.isFile() ? stat.size : 0);
           bus.write32(ptr + 12, ATTR_DEFAULT);
           bus.write32(ptr + 16, stat.isDirectory() ? 2 : 1); // object type
           ptr += 20;
         }
 
-        // Write name + null, padded to word
-        const len = this.writeString(bus, ptr, name);
+        // Write bare name + null, padded to word
+        const len = this.writeString(bus, ptr, baseName);
         for (let p = len; p < namePad; p++) bus.write8(ptr + p, 0);
         ptr += namePad;
 
@@ -339,7 +431,7 @@ export class HostFsHandler {
         const dstAddr  = regs.read(2) >>> 0;
         const dstLen   = regs.read(5) >>> 0;
         const src      = this.readString(bus, srcAddr);
-        if (this.toNative(src) === null) return "passthrough";
+        if (this.toNativeResolved(src) === null) return "passthrough";
         if (dstAddr && dstLen) {
           this.writeString(bus, dstAddr, src.slice(0, dstLen - 1));
         }
