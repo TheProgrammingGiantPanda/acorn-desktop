@@ -350,7 +350,10 @@ function startMachine(romData: Uint8Array, appHostPath?: string): void {
   // No specific app — just boot the ROM and wait for the Filer to start.
   // The Service_StartFiler callback (or the fallback timer) will add the icon.
 
-  launcherWindow?.webContents.send("machine-started", { model: config.model });
+  // Hide the launcher now that the ROM is running — the Filer provides the UI.
+  // (We keep it hidden rather than closed so the app process stays alive while
+  // RISC OS boots and opens its own windows.)
+  launcherWindow?.hide();
 }
 
 // ---------------------------------------------------------------------------
