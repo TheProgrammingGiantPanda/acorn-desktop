@@ -219,30 +219,39 @@ function defaultPalette(mode: number): number[] {
   if (bpp === 1) return RISCOS_2.map(([r, g, b]) => packRgba(r, g, b, 0xFF));
   if (bpp === 2) return RISCOS_4.map(([r, g, b]) => packRgba(r, g, b, 0xFF));
   if (bpp <= 4)  return RISCOS_16.map(([r, g, b]) => packRgba(r, g, b, 0xFF));
-  return generate256Palette();
-}
-
-/**
- * Generate a 256-colour palette using a simplified 3-3-2 RGB encoding.
- * This approximates the true RISC OS 256-colour palette but is not identical —
- * palette-heavy 8bpp sprites may render with incorrect colours.
- * See GitHub issue #22 for implementing the true palette.
- */
-function generate256Palette(): number[] {
-  const p: number[] = [];
-  for (let i = 0; i < 256; i++) {
-    const r = Math.round(((i >> 5) & 0x07) * 255 / 7);
-    const g = Math.round(((i >> 2) & 0x07) * 255 / 7);
-    const b = Math.round( (i       & 0x03) * 255 / 3);
-    p.push(packRgba(r, g, b, 0xFF));
-  }
-  return p;
+  return RISCOS_256 as number[];
 }
 
 function packRgba(r: number, g: number, b: number, a: number): number {
   // Store as little-endian word: R in byte 0, G in byte 1, B in byte 2, A in byte 3
   return (a << 24) | (b << 16) | (g << 8) | r;
 }
+
+/**
+ * True RISC OS 256-colour default palette.
+ *
+ * The VIDC hardware encodes each 8-bit pixel value as follows (PRM Vol 5,
+ * Appendix D; lander.bbcelite.com "Screen memory in the Archimedes"):
+ *
+ *   Bit 7: Blue  bit 3    Bit 3: Blue  bit 2
+ *   Bit 6: Green bit 3    Bit 2: Red   bit 2
+ *   Bit 5: Green bit 2    Bit 1: tint  bit 1  (shared across R, G, B)
+ *   Bit 4: Red   bit 3    Bit 0: tint  bit 0  (shared across R, G, B)
+ *
+ * Each channel is a 4-bit value (0–15) scaled ×17 to give 0–255.
+ * This produces 64 base colours each in 4 tint levels (= 256 entries).
+ */
+const RISCOS_256: readonly number[] = (() => {
+  const p: number[] = [];
+  for (let n = 0; n < 256; n++) {
+    const tint = n & 0x03;
+    const r4   = (((n >> 4) & 1) << 3) | (((n >> 2) & 1) << 2) | tint;
+    const g4   = (((n >> 6) & 1) << 3) | (((n >> 5) & 1) << 2) | tint;
+    const b4   = (((n >> 7) & 1) << 3) | (((n >> 3) & 1) << 2) | tint;
+    p.push(packRgba(r4 * 17, g4 * 17, b4 * 17, 0xFF));
+  }
+  return p;
+})();
 
 /**
  * Decode packed RISC OS pixel data into an RGBA Uint8ClampedArray.
