@@ -14,9 +14,10 @@ import { NativeWimpHost } from "./native-wimp-host.js";
 import { NodeFsHost } from "./node-fs-host.js";
 import { buildAppMenu } from "./menu.js";
 import type { MachineConfig, AppEntry } from "@theprogramminggiantpanda/shared";
-import { IPC } from "@theprogramminggiantpanda/shared";
+import { IPC, Logger } from "@theprogramminggiantpanda/shared";
 
 const isDev = !app.isPackaged;
+const logger = new Logger(isDev ? 'debug' : 'error');
 
 // ---------------------------------------------------------------------------
 // Asset path resolution
@@ -212,31 +213,28 @@ function startMachine(romData: Uint8Array, appHostPath?: string): void {
 
   const nodeFs = new NodeFsHost(fsRoot);
 
-  machine    = new ArchimedesMachine(config);
+  machine    = new ArchimedesMachine(config, logger);
   wimpHost   = new NativeWimpHost();
   dispatcher = new SwiDispatcher(machine, wimpHost, {
     onOutput: (text) => {
-      process.stdout.write(`[RISC OS] ${text}`);
+      logger.debug(`[RISC OS] ${text}`);
       launcherWindow?.webContents.send("console-output", text);
     },
     fs: nodeFs,
     onRunBinary: (riscosPath) => {
-      console.log(`[onRunBinary] loading: ${riscosPath}`);
+      logger.debug(`[onRunBinary] loading: ${riscosPath}`);
       try {
-        const hostPath = nodeFs.resolvePath(riscosPath);
-        console.log(`[onRunBinary] host path: ${hostPath}`);
         const data = nodeFs.readFile(riscosPath);
-        console.log(`[onRunBinary] binary size: ${data.length} bytes — restarting machine`);
-        machine!.cpu.swiTraceEnabled = true;
+        logger.debug(`[onRunBinary] binary size: ${data.length} bytes — starting app`);
         // SWI 0xADBEEF is the AIF "not yet decompressed" guard — halt cleanly.
         machine!.cpu.swiHandlers.set(0xADBEEF, () => {
-          process.stdout.write(`[AIF] decompressor guard SWI — binary not decompressed correctly\n`);
+          logger.debug(`[AIF] decompressor guard SWI — binary not decompressed correctly`);
           machine!.cpu.halted = true;
         });
         machine!.startApp(data);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
-        console.error(`[onRunBinary] failed: ${msg}`);
+        logger.error(`[onRunBinary] failed: ${msg}`);
         launcherWindow?.webContents.send(IPC.ERROR, { message: `Cannot run ${riscosPath}: ${msg}`, fatal: false });
       }
     },
@@ -378,34 +376,33 @@ ipcMain.handle(IPC.BROWSER_LIST_APPS, (): AppEntry[] => {
   try {
     return listApps();
   } catch (err) {
-    console.error("[browser:list-apps]", err);
+    logger.error(`[browser:list-apps] ${err}`);
     return [];
   }
 });
 
 ipcMain.handle(IPC.BROWSER_LAUNCH_APP, (_ev, appName: string) => {
-  console.log(`[launch] ${appName}`);
+  logger.debug(`[launch] ${appName}`);
   const programsDir = resolveAssets("assets", "programs");
   const appHostPath = path.join(programsDir, appName);
 
-  if (!fs.existsSync(appHostPath)) { console.error(`[launch] path not found: ${appHostPath}`); return; }
-  if (!dispatcher) { console.error(`[launch] dispatcher not ready`); return; }
+  if (!fs.existsSync(appHostPath)) { logger.error(`[launch] path not found: ${appHostPath}`); return; }
+  if (!dispatcher) { logger.error(`[launch] dispatcher not ready`); return; }
 
   const programsFs = new NodeFsHost(programsDir);
   const runScript  = `$.${appName}.!Run`;
 
   if (programsFs.stat(runScript) !== null) {
-    console.log(`[launch] running obey: ${runScript}`);
+    logger.debug(`[launch] running obey: ${runScript}`);
     dispatcher.obey.runFile(runScript);
-    console.log(`[launch] obey complete`);
   } else {
     const runImage = `$.${appName}.!RunImage`;
-    console.log(`[launch] no !Run, trying binary: ${runImage}`);
+    logger.debug(`[launch] no !Run, trying binary: ${runImage}`);
     if (programsFs.stat(runImage) !== null) {
       const data = programsFs.readFile(runImage);
       machine!.startApp(data);
     } else {
-      console.error(`[launch] no !Run or !RunImage found in ${appName}`);
+      logger.error(`[launch] no !Run or !RunImage found in ${appName}`);
     }
   }
 });

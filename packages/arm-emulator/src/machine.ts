@@ -11,6 +11,7 @@ import { SystemBus } from "./memory/bus.js";
 import { MEMC } from "./chips/memc.js";
 import { IOC }  from "./chips/ioc.js";
 import type { MachineConfig } from "@theprogramminggiantpanda/shared";
+import { Logger } from "@theprogramminggiantpanda/shared";
 
 const ARM2_CLOCK_HZ = 8_000_000;
 const ARM3_CLOCK_HZ = 25_000_000;
@@ -31,7 +32,7 @@ export class ArchimedesMachine {
   private lastMeasure   = 0;
   private _dataAbortCount = 0;
 
-  constructor(private readonly config: MachineConfig) {
+  constructor(private readonly config: MachineConfig, private readonly logger = new Logger()) {
     this.memc = new MEMC();
     this.ioc  = new IOC();
 
@@ -45,15 +46,15 @@ export class ArchimedesMachine {
     } as unknown as import("./chips/vidc.js").VIDC;
 
     this.bus = new SystemBus(config.ramSize, vidcStub, this.memc, this.ioc);
-    this.cpu = new ARM2CPU(this.bus, config.cpuVariant as CpuVariant);
+    this.cpu = new ARM2CPU(this.bus, config.cpuVariant as CpuVariant, logger);
 
     this.ioc.onIRQ = () => this.cpu.triggerIRQ();
     this.ioc.onFIQ = () => this.cpu.triggerFIQ();
     this.bus.onDataAbort = () => {
-      if (this.cpu.swiTraceEnabled && this._dataAbortCount < 5) {
+      if (this._dataAbortCount < 5) {
         this._dataAbortCount++;
         const pc = this.cpu.regs.pc.toString(16).padStart(8, '0');
-        process.stdout.write(`[data abort #${this._dataAbortCount}] PC=0x${pc}\n`);
+        this.logger.debug(`[data abort #${this._dataAbortCount}] PC=0x${pc}`);
       }
       this.cpu.triggerDataAbort();
     };
@@ -225,7 +226,7 @@ export class ArchimedesMachine {
       this.cpu.step(steps);
     } catch (err) {
       const pc = this.cpu.regs.pc.toString(16).padStart(8, '0');
-      process.stdout.write(`[CPU crash] PC=0x${pc} — ${err}\n`);
+      this.logger.error(`[CPU crash] PC=0x${pc} — ${err}`);
       this.running = false;
       return;
     }

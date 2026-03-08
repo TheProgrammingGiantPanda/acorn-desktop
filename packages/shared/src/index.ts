@@ -1,5 +1,28 @@
 // Shared types for the Acorn Archimedes emulator
 
+// ---------------------------------------------------------------------------
+// Logger
+// ---------------------------------------------------------------------------
+export type LogLevel = 'debug' | 'info' | 'error' | 'silent';
+
+const LEVELS: Record<LogLevel, number> = { debug: 0, info: 1, error: 2, silent: 3 };
+
+export class Logger {
+  constructor(readonly level: LogLevel = 'silent') {}
+
+  debug(msg: string): void {
+    if (LEVELS[this.level] <= 0) console.debug(msg);
+  }
+
+  info(msg: string): void {
+    if (LEVELS[this.level] <= 1) console.info(msg);
+  }
+
+  error(msg: string): void {
+    if (LEVELS[this.level] <= 2) console.error(msg);
+  }
+}
+
 export type MachineModel = "A305" | "A310" | "A410" | "A3000" | "A5000";
 
 export interface MachineConfig {
@@ -59,7 +82,7 @@ export interface AppEntry {
   name:        string;   // e.g. "!SciCalc"
   displayName: string;   // e.g. "SciCalc"
   sprite?: {
-    rgba:   number[];    // flat RGBA Uint8ClampedArray serialised as plain array
+    rgba:   number[];  // flat RGBA Uint8ClampedArray serialised as plain array
     width:  number;
     height: number;
   };

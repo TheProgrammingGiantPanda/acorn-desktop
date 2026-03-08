@@ -1,19 +1,20 @@
 import { contextBridge, ipcRenderer } from "electron";
+import { IPC } from "@theprogramminggiantpanda/shared";
 
 const browserAPI = {
   listApps: (): Promise<unknown[]> =>
-    ipcRenderer.invoke("browser:list-apps"),
+    ipcRenderer.invoke(IPC.BROWSER_LIST_APPS),
 
   launchApp: (name: string): Promise<void> =>
-    ipcRenderer.invoke("browser:launch-app", name),
+    ipcRenderer.invoke(IPC.BROWSER_LAUNCH_APP, name),
 
   installApp: (hostPath: string): Promise<{ ok: boolean; error?: string }> =>
-    ipcRenderer.invoke("browser:install-app", hostPath),
+    ipcRenderer.invoke(IPC.BROWSER_INSTALL_APP, hostPath),
 
   onRefresh: (cb: () => void) => {
     const handler = () => cb();
-    ipcRenderer.on("browser:refresh", handler);
-    return () => ipcRenderer.off("browser:refresh", handler);
+    ipcRenderer.on(IPC.BROWSER_REFRESH, handler);
+    return () => ipcRenderer.off(IPC.BROWSER_REFRESH, handler);
   },
 };
 

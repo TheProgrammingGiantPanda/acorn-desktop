@@ -14,6 +14,7 @@
 
 import { RegisterFile, Mode, PC_MASK, IRQ_MASK_BIT, FIQ_MASK_BIT } from "./registers.js";
 import type { SystemBus } from "../memory/bus.js";
+import { Logger } from "@theprogramminggiantpanda/shared";
 
 /** A SWI handler receives the live register file and system bus. */
 export type SwiHandler = (regs: RegisterFile, bus: SystemBus) => void;
@@ -93,7 +94,8 @@ export class ARM2CPU {
 
   constructor(
     private readonly bus: SystemBus,
-    readonly variant: CpuVariant = "ARM2"
+    readonly variant: CpuVariant = "ARM2",
+    private readonly logger = new Logger()
   ) {}
 
   reset(): void {
@@ -412,16 +414,15 @@ export class ARM2CPU {
   swiPending = false;
 
   /** Enable SWI call tracing to stdout */
-  swiTraceEnabled = false;
   private _swiSeen = new Set<number>();
 
   private execSWI(instr: number): void {
     const swiNum = instr & 0x00FF_FFFF;
     const handler = this.swiHandlers.get(swiNum);
-    if (this.swiTraceEnabled && !this._swiSeen.has(swiNum)) {
+    if (!this._swiSeen.has(swiNum)) {
       this._swiSeen.add(swiNum);
       const tag = handler ? "handled" : "UNHANDLED";
-      process.stdout.write(`[SWI] 0x${swiNum.toString(16).padStart(6,'0')} ${tag}\n`);
+      this.logger.debug(`[SWI] 0x${swiNum.toString(16).padStart(6,'0')} ${tag}`);
     }
     if (handler) {
       handler(this.regs, this.bus);
