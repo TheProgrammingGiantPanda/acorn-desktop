@@ -426,7 +426,7 @@ export class ARM2CPU {
     const handler = this.swiHandlers.get(swiNum);
     if (!this._swiSeen.has(swiNum)) {
       this._swiSeen.add(swiNum);
-      const tag = handler ? "handled" : "UNHANDLED";
+      const tag = handler ? "→JS" : "→ROM";
       this.logger.debug(`[SWI] 0x${swiNum.toString(16).padStart(6,'0')} ${tag}`);
     }
     if (handler) {
