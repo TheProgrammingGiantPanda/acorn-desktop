@@ -21,7 +21,16 @@ import * as SWI from "../swi-numbers.js";
 export interface DispatcherOptions {
   /** Called when the emulated program writes text output */
   onOutput?: OutputCallback;
-  /** If provided, OS file-system SWIs (OS_File, OS_Find, etc.) are active */
+  /**
+   * Filesystem for the ObeyInterpreter to read !Run / !Boot scripts.
+   * When omitted, Obey cannot execute script files (inline commands still work).
+   */
+  obeyFs?: FileSystemHost;
+  /**
+   * If provided, HLE OS file-system SWIs (OS_File, OS_Find, OS_Args,
+   * OS_BGet, OS_BPut, OS_GBPB, OS_FSControl) are registered on the CPU.
+   * Omit in ROM boot mode — the real ROM FileSwitch handles those SWIs.
+   */
   fs?: FileSystemHost;
   /** Called when an Obey Run command targets an ARM binary */
   onRunBinary?: (riscosPath: string) => void;
@@ -44,7 +53,7 @@ export class SwiDispatcher {
     this.sysvar      = new SystemVariables();
     this.spriteAreas = new SpriteAreaRegistry();
     this.modules     = new ModuleRegistry();
-    this.obey        = new ObeyInterpreter(options.fs, this.sysvar, {
+    this.obey        = new ObeyInterpreter(options.obeyFs ?? options.fs, this.sysvar, {
       onOutput:    options.onOutput,
       onRunBinary: options.onRunBinary,
       spritePool:  this.spriteAreas.system,

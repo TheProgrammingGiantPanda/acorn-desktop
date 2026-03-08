@@ -217,16 +217,16 @@ function startMachine(romData: Uint8Array, appHostPath?: string): void {
 
   machine    = new ArchimedesMachine(config, logger);
   wimpHost   = new NativeWimpHost();
-  // fs is passed so ObeyInterpreter can read !Run / !Boot scripts from disk.
-  // The HLE file SWIs it registers are immediately overwritten by HostFsHandler
-  // below, so only HostFS:: paths are served from Node; everything else
-  // passes through to the real ROM FileSwitch.
+  // obeyFs gives the ObeyInterpreter access to !Run / !Boot scripts on disk.
+  // fs is intentionally omitted: in ROM boot mode the real ROM FileSwitch
+  // handles OS_File / OS_Find / etc.; HostFsHandler (registered below)
+  // intercepts only HostFS:: paths and passes everything else through to ROM.
   dispatcher = new SwiDispatcher(machine, wimpHost, {
     onOutput: (text) => {
       logger.debug(`[RISC OS] ${text}`);
       launcherWindow?.webContents.send("console-output", text);
     },
-    fs: nodeFs,
+    obeyFs: nodeFs,
     onRunBinary: (riscosPath) => {
       logger.debug(`[onRunBinary] loading: ${riscosPath}`);
       try {
