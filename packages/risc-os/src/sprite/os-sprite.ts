@@ -57,12 +57,12 @@ export class OSSpriteHandler {
   }
 
   /**
-   * Handle Wimp_SpriteOp — always targets the Wimp sprite area.
-   * The caller sets R0 = reason code only (the Wimp would add 0x100 before
-   * forwarding to OS_SpriteOp, but we intercept here directly).
+   * Handle Wimp_SpriteOp.
+   * The Wimp sets R1 to the system sprite area pointer and adds 0x100 to R0
+   * before forwarding to OS_SpriteOp — so the Wimp and system areas are the
+   * same pool (registry.wimp is an alias for registry.system).
    */
   handleWimp(regs: Regs, bus: Bus): void {
-    // Wimp sprite area is separate from the OS system area
     this.dispatchWithPool(this.registry.wimp, regs.read(0), regs, bus);
   }
 

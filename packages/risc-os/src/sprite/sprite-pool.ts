@@ -313,14 +313,17 @@ interface UserEntry {
  *   R0 & 0x100 = 1 → user area (R1 = ARM memory pointer)
  */
 export class SpriteAreaRegistry {
-  /** OS system sprite area — OS_SpriteOp without area flag. */
+  /**
+   * The system sprite area.
+   * Per the RISC OS PRM, Wimp_SpriteOp sets R1 to the system sprite area
+   * pointer before forwarding to OS_SpriteOp, so the Wimp area and the OS
+   * system area are the same pool.  IconSprites, Wimp_SpriteOp, and
+   * OS_SpriteOp (without area flag) all read/write here.
+   */
   readonly system = new SpritePool();
 
-  /**
-   * Wimp sprite area — Wimp_SpriteOp and IconSprites.
-   * This is a separate area from system; the Wimp allocates and manages it.
-   */
-  readonly wimp   = new SpritePool();
+  /** Alias for system — Wimp_SpriteOp targets the same pool. */
+  get wimp(): SpritePool { return this.system; }
 
   private readonly userCache = new Map<number, UserEntry>();
 
