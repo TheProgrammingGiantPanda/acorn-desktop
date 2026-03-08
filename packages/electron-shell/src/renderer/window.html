@@ -8,11 +8,46 @@
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     html, body { width: 100%; height: 100%; overflow: hidden; background: #fff; }
-    #canvas { display: block; width: 100%; height: 100%; cursor: default; }
+
+    /*
+     * #scroll-outer: the native scroll container.
+     * Native OS scroll bars appear when #scroll-inner is larger than this.
+     */
+    #scroll-outer {
+      width: 100%; height: 100%;
+      overflow: auto;
+      position: relative;
+    }
+
+    /*
+     * #scroll-inner: sized to the RISC OS work area (in pixels) by JS.
+     * Its dimensions drive the scroll bars.
+     */
+    #scroll-inner {
+      position: relative;
+      min-width: 100%;
+      min-height: 100%;
+    }
+
+    /*
+     * #canvas: sticky — always visible at the top-left of the viewport
+     * even as the user scrolls #scroll-outer.
+     */
+    #canvas {
+      position: sticky;
+      top: 0;
+      left: 0;
+      display: block;
+      cursor: default;
+    }
   </style>
 </head>
 <body>
-  <canvas id="canvas"></canvas>
+  <div id="scroll-outer">
+    <div id="scroll-inner">
+      <canvas id="canvas"></canvas>
+    </div>
+  </div>
   <script type="module" src="./window-renderer.ts"></script>
 </body>
 </html>

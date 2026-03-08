@@ -16,6 +16,10 @@ contextBridge.exposeInMainWorld("wimpWindow", {
   onKey: (charCode: number) => {
     ipcRenderer.send("wimp-key", { winHandle: wimpHandle, charCode });
   },
+  /** Notify main that the user has scrolled to a new RISC OS scroll position */
+  sendScroll: (scrollX: number, scrollY: number) => {
+    ipcRenderer.send("wimp-scroll", { winHandle: wimpHandle, scrollX, scrollY });
+  },
   onDraw: (callback: (cmds: unknown[]) => void) => {
     ipcRenderer.on("wimp-draw", (_, cmds) => callback(cmds));
   },
@@ -24,5 +28,13 @@ contextBridge.exposeInMainWorld("wimpWindow", {
   },
   onResize: (callback: () => void) => {
     ipcRenderer.on("wimp-resize", () => callback());
+  },
+  /** Receive work-area / scroll-position info from main to drive scroll bars */
+  onWorkArea: (callback: (data: {
+    scrollX: number; scrollY: number;
+    workX0: number; workY0: number; workX1: number; workY1: number;
+    hasHScroll: boolean; hasVScroll: boolean;
+  }) => void) => {
+    ipcRenderer.on("wimp-workarea", (_, data) => callback(data));
   },
 });

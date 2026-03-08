@@ -40,7 +40,9 @@ export interface NativeHost {
   createWindow(handle: number, def: WimpWindowDef): Promise<string>;
 
   /** Show/reposition a native window */
-  openWindow(handle: number, def: Pick<WimpWindowDef, "visX0"|"visY0"|"visX1"|"visY1"|"scrollX"|"scrollY"|"behind">): Promise<void>;
+  openWindow(handle: number, def: Pick<WimpWindowDef,
+    "visX0"|"visY0"|"visX1"|"visY1"|"scrollX"|"scrollY"|"behind"
+    |"workX0"|"workY0"|"workX1"|"workY1"|"flags">): Promise<void>;
 
   /** Hide a native window (keep it alive) */
   closeWindow(handle: number): Promise<void>;

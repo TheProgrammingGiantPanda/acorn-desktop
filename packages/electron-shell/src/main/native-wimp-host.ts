@@ -127,7 +127,9 @@ export class NativeWimpHost implements NativeHost {
 
   async openWindow(
     handle: number,
-    def: Pick<WimpWindowDef, "visX0"|"visY0"|"visX1"|"visY1"|"scrollX"|"scrollY"|"behind">
+    def: Pick<WimpWindowDef,
+      "visX0"|"visY0"|"visX1"|"visY1"|"scrollX"|"scrollY"|"behind"
+      |"workX0"|"workY0"|"workX1"|"workY1"|"flags">
   ): Promise<void> {
     const win = this.windows.get(handle);
     if (!win) return;
@@ -138,6 +140,19 @@ export class NativeWimpHost implements NativeHost {
     win.show();
     win.focus();
     if (def.behind === -2) win.setAlwaysOnTop(false); // send to back (best effort)
+
+    // Inform renderer of the work area so it can size the scroll bars
+    // RISC OS window flags: bit 8 = vertical scroll bar, bit 9 = horizontal scroll bar
+    win.webContents.send("wimp-workarea", {
+      scrollX:    def.scrollX,
+      scrollY:    def.scrollY,
+      workX0:     def.workX0,
+      workY0:     def.workY0,
+      workX1:     def.workX1,
+      workY1:     def.workY1,
+      hasVScroll: !!(def.flags & (1 << 8)),
+      hasHScroll: !!(def.flags & (1 << 9)),
+    });
   }
 
   async closeWindow(handle: number): Promise<void> {
@@ -309,6 +324,28 @@ export class NativeWimpHost implements NativeHost {
         code: WimpEvent.Click,
         data: [-2, taskHandle, buttons, 0, 0, 0, 0, 0],
       });
+    });
+
+    // User scrolled the native scroll bars → deliver Open_Window_Request + Redraw
+    ipcMain.on("wimp-scroll", (_ev, { winHandle, scrollX, scrollY }: { winHandle: number; scrollX: number; scrollY: number }) => {
+      const win = this.windows.get(winHandle);
+      if (!win || win.isDestroyed()) return;
+
+      this.windowScroll.set(winHandle, { scrollX, scrollY });
+
+      // Reconstruct the vis bounds from the current native window content area
+      const { x, y, width, height } = win.getContentBounds();
+      const H    = screen.getPrimaryDisplay().workAreaSize.height;
+      const osX0 = x * 2;
+      const osY0 = (H - y - height) * 2;
+      const osX1 = (x + width) * 2;
+      const osY1 = (H - y) * 2;
+
+      this.deliverEvent({
+        code: WimpEvent.Open,
+        data: [winHandle, osX0, osY0, osX1, osY1, scrollX, scrollY, -1],
+      });
+      this.deliverEvent({ code: WimpEvent.Redraw, data: [winHandle] });
     });
 
     // Null poll timer — keep apps alive even when idle
