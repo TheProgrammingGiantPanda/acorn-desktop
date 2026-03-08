@@ -103,6 +103,9 @@ function bootAllApps(): void {
       const obey = new ObeyInterpreter(programsFs, dispatcher.sysvar, {
         onOutput,
         spritePool: dispatcher.spriteAreas.system,
+        // onRunBinary intentionally omitted: !Boot scripts almost never run
+        // ARM binaries directly, and there is no machine context to load into
+        // at this point in the boot sequence.
       });
       obey.runFile(bootPath);
     } else if (programsFs.stat(spritePath) !== null) {

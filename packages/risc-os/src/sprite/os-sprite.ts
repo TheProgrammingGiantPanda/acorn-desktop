@@ -190,7 +190,7 @@ export class OSSpriteHandler {
 
 function readCString(bus: Bus, addr: number): string {
   let s = '';
-  for (let i = 0; i < 256; i++) {
+  for (let i = 0; i < 4096; i++) {
     const c = bus.read8(addr + i);
     if (c === 0) break;
     s += String.fromCharCode(c);

@@ -60,6 +60,13 @@ export class SpritePool {
    * Memory format includes the area-size word at +0, so the layout is:
    *   +0  area size  +4  num sprites  +8  first sprite offset  +12  free offset
    * Offsets are area-relative (no adjustment needed).
+   *
+   * User area file data is written at ptr+4 (after the preserved size word).
+   * The file's first_sprite_mem_offset is already area-relative (e.g. 16 means
+   * 16 bytes from the start of the area, which is ptr+16 in absolute terms).
+   * Since `data` here starts at ptr (not ptr+4), no offset correction is needed —
+   * unlike loadArea() which must subtract 4 to convert from memory-relative to
+   * file-relative positions.
    */
   loadAreaFromMemory(data: Uint8Array): void {
     if (data.length < 16) return;
@@ -215,7 +222,12 @@ function defaultPalette(mode: number): number[] {
   return generate256Palette();
 }
 
-/** Generate the RISC OS standard 256-colour palette (simplified 3-3-2 RGB). */
+/**
+ * Generate a 256-colour palette using a simplified 3-3-2 RGB encoding.
+ * This approximates the true RISC OS 256-colour palette but is not identical —
+ * palette-heavy 8bpp sprites may render with incorrect colours.
+ * See GitHub issue #22 for implementing the true palette.
+ */
 function generate256Palette(): number[] {
   const p: number[] = [];
   for (let i = 0; i < 256; i++) {
@@ -305,9 +317,12 @@ interface UserEntry {
  * Manages separate sprite pools for each RISC OS sprite area.
  *
  *   system — OS system sprite area; used by OS_SpriteOp without area flag.
- *            IconSprites does NOT use this — it targets the Wimp area.
- *   wimp   — Wimp's own sprite area; target of Wimp_SpriteOp and IconSprites.
- *            Separate from the OS system area.
+ *            On real RISC OS, Wimp maintains a separate sprite area, but per the
+ *            PRM (Wimp_SpriteOp, chapter 3) Wimp_SpriteOp forwards to OS_SpriteOp
+ *            with R1 set to the system sprite area pointer, so the two are the same
+ *            pool in practice.  `wimp` below is therefore an alias for `system`.
+ *   wimp   — Alias for system (see above).  IconSprites and Wimp_SpriteOp both
+ *            route here.
  *   user   — Per-application areas in ARM memory, identified by R1 (the
  *            address of the allocated sprite area block).  The first word of
  *            that block is the area size; subsequent words are the standard
