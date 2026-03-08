@@ -241,7 +241,7 @@ function startMachine(romData: Uint8Array, appHostPath?: string): void {
   });
 
   machine.loadROM(romData);
-  machine.start();
+  machine.bootROM();
 
   bootAllApps();
 
