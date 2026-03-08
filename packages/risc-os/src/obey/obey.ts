@@ -20,6 +20,7 @@
 import type { FileSystemHost } from '../fs/fs-host.js';
 import type { SystemVariables } from '../sysvar/sysvar.js';
 import type { SpritePool } from '../sprite/sprite-pool.js';
+import { ModuleRegistry, moduleLeafName } from '../modules/module-registry.js';
 
 export interface ObeyOptions {
   onOutput?:    (text: string) => void;
@@ -27,12 +28,15 @@ export interface ObeyOptions {
   onRunBinary?: (riscosPath: string) => void;
   /** Sprite pool to load sprites into when IconSprites is executed. */
   spritePool?:  SpritePool;
+  /** Module registry shared with the SWI dispatcher. */
+  modules?:     ModuleRegistry;
 }
 
 export class ObeyInterpreter {
   private readonly output:    (text: string) => void;
   private readonly runBinary: (path: string) => void;
   private readonly spritePool: SpritePool | undefined;
+  private readonly modules:    ModuleRegistry;
 
   constructor(
     private readonly fs:     FileSystemHost | undefined,
@@ -42,6 +46,7 @@ export class ObeyInterpreter {
     this.output     = options.onOutput    ?? (() => {});
     this.runBinary  = options.onRunBinary ?? (() => {});
     this.spritePool = options.spritePool;
+    this.modules    = options.modules ?? new ModuleRegistry();
   }
 
   // ── Public API ─────────────────────────────────────────────────────────────
@@ -111,6 +116,10 @@ export class ObeyInterpreter {
   }
 
   private cmdRun(path: string): void {
+    // Strip any trailing arguments (e.g. "%*0" Obey parameter substitution).
+    // RISC OS paths never contain spaces, so the first whitespace-delimited
+    // token is always the file path.
+    path = path.split(/\s+/)[0] ?? '';
     if (!path) return;
 
     if (!this.fs) {
@@ -157,17 +166,24 @@ export class ObeyInterpreter {
   }
 
   private cmdRMLoad(path: string): void {
-    // Stub: log and succeed. Real implementation: issue #3.
-    this.output(`RMLoad: ${path} (not yet implemented)\r\n`);
+    const leaf = moduleLeafName(path);
+    const entry = this.modules.findByFilename(leaf);
+    if (entry) {
+      // Built-in stub — already registered, nothing else needed.
+      return;
+    }
+    // Future: attempt to load from filesystem and parse module header.
+    this.output(`RMLoad: ${path} (no stub available)\r\n`);
   }
 
   private cmdRMEnsure(args: string): void {
     // RMEnsure <ModuleName> <MinVersion> [<FallbackCommand>]
     const m = args.match(/^(\S+)\s+(\S+)(?:\s+(.*))?$/s);
     if (!m) return;
-    // Stub: module not loaded → run fallback command if provided
-    const fallback = m[3]?.trim();
-    if (fallback) this.executeLine(fallback);
+    const [, name, version, fallback] = m as [string, string, string, string | undefined];
+    if (!this.modules.ensure(name, version)) {
+      if (fallback?.trim()) this.executeLine(fallback.trim());
+    }
   }
 
   private cmdIf(args: string): void {

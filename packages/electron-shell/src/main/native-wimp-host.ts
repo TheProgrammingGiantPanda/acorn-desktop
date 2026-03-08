@@ -240,18 +240,18 @@ export class NativeWimpHost implements NativeHost {
   }
 
   private createIconbar(): void {
-    const disp   = screen.getPrimaryDisplay();
-    const { width, height } = disp.workAreaSize;
+    const disp = screen.getPrimaryDisplay();
+    const { x: areaX, y: areaY, width, height } = disp.workArea;
 
     this.iconbarWin = new BrowserWindow({
-      x: 0,
-      y: height - 68,
+      x: areaX,
+      y: areaY + height - 68,
       width,
       height: 68,
       frame: false,
       resizable: false,
       movable: false,
-      alwaysOnTop: false,
+      alwaysOnTop: true,
       skipTaskbar: true,
       focusable: false,
       transparent: true,

@@ -9,14 +9,27 @@ import { app, BrowserWindow, ipcMain, Menu, dialog } from "electron";
 import path from "path";
 import fs from "fs";
 import { ArchimedesMachine } from "@theprogramminggiantpanda/arm-emulator";
-import { SwiDispatcher, ObeyInterpreter } from "@theprogramminggiantpanda/risc-os";
+import { SwiDispatcher, ObeyInterpreter, SpritePool } from "@theprogramminggiantpanda/risc-os";
 import { NativeWimpHost } from "./native-wimp-host.js";
 import { NodeFsHost } from "./node-fs-host.js";
 import { buildAppMenu } from "./menu.js";
-import type { MachineConfig } from "@theprogramminggiantpanda/shared";
-import { IPC } from "@theprogramminggiantpanda/shared";
+import type { MachineConfig, AppEntry } from "@theprogramminggiantpanda/shared";
+import { IPC, Logger } from "@theprogramminggiantpanda/shared";
 
 const isDev = !app.isPackaged;
+const logger = new Logger(isDev ? 'debug' : 'error');
+
+// ---------------------------------------------------------------------------
+// Asset path resolution
+// In dev, `electron .` runs from packages/electron-shell/ but assets/ lives
+// at the monorepo root (two levels up).  In a packaged app, assets are
+// bundled inside app.getAppPath().
+// ---------------------------------------------------------------------------
+function resolveAssets(...parts: string[]): string {
+  const localPath = path.join(app.getAppPath(), ...parts);
+  if (fs.existsSync(localPath)) return localPath;
+  return path.join(app.getAppPath(), "..", "..", ...parts);
+}
 
 let machine:    ArchimedesMachine | null = null;
 let dispatcher: SwiDispatcher    | null = null;
@@ -66,7 +79,8 @@ function createLauncherWindow(): BrowserWindow {
   return win;
 }
 
-let launcherWindow: BrowserWindow | null = null;
+let launcherWindow:        BrowserWindow | null = null;
+let programsBrowserWindow: BrowserWindow | null = null;
 
 // ---------------------------------------------------------------------------
 // Boot sequence: run !Boot for every app in assets/programs/
@@ -74,7 +88,7 @@ let launcherWindow: BrowserWindow | null = null;
 function bootAllApps(): void {
   if (!dispatcher) return;
 
-  const programsDir = path.join(app.getAppPath(), "assets", "programs");
+  const programsDir = resolveAssets("assets", "programs");
   let entries: string[];
   try {
     entries = fs.readdirSync(programsDir);
@@ -118,6 +132,72 @@ function bootAllApps(): void {
 }
 
 // ---------------------------------------------------------------------------
+// Programs browser window
+// ---------------------------------------------------------------------------
+function createProgramsBrowserWindow(): BrowserWindow {
+  const win = new BrowserWindow({
+    width:       480,
+    height:      400,
+    minWidth:    320,
+    minHeight:   200,
+    title:       "Programs",
+    webPreferences: {
+      preload: path.join(__dirname, "../preload/programs-browser-preload.js"),
+      contextIsolation: true,
+      nodeIntegration: false,
+    },
+  });
+
+  if (isDev) {
+    win.loadURL("http://localhost:5173/programs-browser.html");
+  } else {
+    win.loadFile(path.join(__dirname, "../../renderer/programs-browser.html"));
+  }
+
+  win.on("closed", () => { programsBrowserWindow = null; });
+  return win;
+}
+
+/** Scan assets/programs/ and build the app list with decoded sprites. */
+function listApps(): AppEntry[] {
+  const programsDir = resolveAssets("assets", "programs");
+  let entries: string[] = [];
+  try { entries = fs.readdirSync(programsDir); } catch { return []; }
+
+  return entries
+    .filter(name => name.startsWith("!"))
+    .filter(name => {
+      try { return fs.statSync(path.join(programsDir, name)).isDirectory(); }
+      catch { return false; }
+    })
+    .sort()
+    .map((name): AppEntry => {
+      const displayName = name.slice(1); // strip leading "!"
+      const spriteName  = displayName.toLowerCase();
+      const spritePath  = path.join(programsDir, name, "!Sprites");
+      let sprite: AppEntry["sprite"] | undefined;
+
+      try {
+        const data = fs.readFileSync(spritePath);
+        const pool = new SpritePool();
+        pool.loadArea(new Uint8Array(data));
+
+        // Try "!name" first (RISC OS convention), then plain "name"
+        const found = pool.get(`!${spriteName}`) ?? pool.get(spriteName);
+        if (found) {
+          sprite = {
+            rgba:   Array.from(found.rgba),
+            width:  found.width,
+            height: found.height,
+          };
+        }
+      } catch { /* no !Sprites or parse error — use generic icon */ }
+
+      return { name, displayName, sprite };
+    });
+}
+
+// ---------------------------------------------------------------------------
 // Machine lifecycle
 // ---------------------------------------------------------------------------
 function startMachine(romData: Uint8Array, appHostPath?: string): void {
@@ -125,24 +205,36 @@ function startMachine(romData: Uint8Array, appHostPath?: string): void {
 
   // When launching a specific app, root the FS at the app's parent directory
   // so the app dir is accessible as $.!AppName inside RISC OS.
-  // Otherwise use the standard ~/Documents/RISCOS root.
+  // In programs-browser mode (no appHostPath), root at assets/programs/ so
+  // dispatcher.obey.runFile("$.!AppName.!Run") resolves correctly.
   const fsRoot = appHostPath
     ? path.dirname(path.resolve(appHostPath))
-    : path.join(app.getPath("documents"), "RISCOS");
+    : resolveAssets("assets", "programs");
 
   const nodeFs = new NodeFsHost(fsRoot);
 
-  machine    = new ArchimedesMachine(config);
+  machine    = new ArchimedesMachine(config, logger);
   wimpHost   = new NativeWimpHost();
   dispatcher = new SwiDispatcher(machine, wimpHost, {
-    onOutput: (text) => launcherWindow?.webContents.send("console-output", text),
+    onOutput: (text) => {
+      logger.debug(`[RISC OS] ${text}`);
+      launcherWindow?.webContents.send("console-output", text);
+    },
     fs: nodeFs,
     onRunBinary: (riscosPath) => {
+      logger.debug(`[onRunBinary] loading: ${riscosPath}`);
       try {
         const data = nodeFs.readFile(riscosPath);
-        machine!.loadProgram(data);
+        logger.debug(`[onRunBinary] binary size: ${data.length} bytes — starting app`);
+        // SWI 0xADBEEF is the AIF "not yet decompressed" guard — halt cleanly.
+        machine!.cpu.swiHandlers.set(0xADBEEF, () => {
+          logger.debug(`[AIF] decompressor guard SWI — binary not decompressed correctly`);
+          machine!.cpu.halted = true;
+        });
+        machine!.startApp(data);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
+        logger.error(`[onRunBinary] failed: ${msg}`);
         launcherWindow?.webContents.send(IPC.ERROR, { message: `Cannot run ${riscosPath}: ${msg}`, fatal: false });
       }
     },
@@ -155,6 +247,13 @@ function startMachine(romData: Uint8Array, appHostPath?: string): void {
 
   if (appHostPath) {
     launchApp(nodeFs, appHostPath);
+  } else {
+    // No specific app — open the programs browser
+    if (!programsBrowserWindow || programsBrowserWindow.isDestroyed()) {
+      programsBrowserWindow = createProgramsBrowserWindow();
+    } else {
+      programsBrowserWindow.focus();
+    }
   }
 
   launcherWindow?.webContents.send("machine-started", { model: config.model });
@@ -271,10 +370,91 @@ ipcMain.handle(IPC.LOAD_ROM,  async (_ev, payload: { path: string }) => {
 });
 
 // ---------------------------------------------------------------------------
+// Programs browser IPC
+// ---------------------------------------------------------------------------
+ipcMain.handle(IPC.BROWSER_LIST_APPS, (): AppEntry[] => {
+  try {
+    return listApps();
+  } catch (err) {
+    logger.error(`[browser:list-apps] ${err}`);
+    return [];
+  }
+});
+
+ipcMain.handle(IPC.BROWSER_LAUNCH_APP, (_ev, appName: string) => {
+  logger.debug(`[launch] ${appName}`);
+  const programsDir = resolveAssets("assets", "programs");
+  const appHostPath = path.join(programsDir, appName);
+
+  if (!fs.existsSync(appHostPath)) { logger.error(`[launch] path not found: ${appHostPath}`); return; }
+  if (!dispatcher) { logger.error(`[launch] dispatcher not ready`); return; }
+
+  const programsFs = new NodeFsHost(programsDir);
+  const runScript  = `$.${appName}.!Run`;
+
+  if (programsFs.stat(runScript) !== null) {
+    logger.debug(`[launch] running obey: ${runScript}`);
+    dispatcher.obey.runFile(runScript);
+  } else {
+    const runImage = `$.${appName}.!RunImage`;
+    logger.debug(`[launch] no !Run, trying binary: ${runImage}`);
+    if (programsFs.stat(runImage) !== null) {
+      const data = programsFs.readFile(runImage);
+      machine!.startApp(data);
+    } else {
+      logger.error(`[launch] no !Run or !RunImage found in ${appName}`);
+    }
+  }
+});
+
+ipcMain.handle(IPC.BROWSER_INSTALL_APP, async (_ev, hostPath: string): Promise<{ ok: boolean; error?: string }> => {
+  try {
+    const name = path.basename(hostPath);
+    if (!name.startsWith("!")) {
+      return { ok: false, error: `Directory name must start with '!': ${name}` };
+    }
+
+    const stat = fs.statSync(hostPath);
+    if (!stat.isDirectory()) {
+      return { ok: false, error: "Only !App directories can be installed" };
+    }
+
+    const programsDir = resolveAssets("assets", "programs");
+    const destDir     = path.join(programsDir, name);
+    fs.cpSync(hostPath, destDir, { recursive: true });
+
+    // Run !Boot for the newly installed app
+    if (dispatcher) {
+      const programsFs = new NodeFsHost(programsDir);
+      const bootPath   = `$.${name}.!Boot`;
+      const spritePath = `$.${name}.!Sprites`;
+
+      if (programsFs.stat(bootPath) !== null) {
+        const obey = new ObeyInterpreter(programsFs, dispatcher.sysvar, {
+          onOutput: (text) => launcherWindow?.webContents.send("console-output", text),
+          spritePool: dispatcher.spriteAreas.system,
+        });
+        obey.runFile(bootPath);
+      } else if (programsFs.stat(spritePath) !== null) {
+        try {
+          dispatcher.spriteAreas.system.loadArea(programsFs.readFile(spritePath));
+        } catch { /* ignore */ }
+      }
+    }
+
+    // Tell the browser window to refresh
+    programsBrowserWindow?.webContents.send(IPC.BROWSER_REFRESH);
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: String(err) };
+  }
+});
+
+// ---------------------------------------------------------------------------
 // Auto-load ROM from assets/roms/ on startup
 // ---------------------------------------------------------------------------
 function tryAutoLoadROM(): void {
-  const romsDir = path.join(app.getAppPath(), "assets", "roms");
+  const romsDir = resolveAssets("assets", "roms");
 
   let files: string[] = [];
   try {
@@ -309,15 +489,27 @@ function tryAutoLoadROM(): void {
 // App lifecycle
 // ---------------------------------------------------------------------------
 app.whenReady().then(() => {
-  launcherWindow = createLauncherWindow();
-  launcherWindow.on("closed", () => { launcherWindow = null; });
+  Menu.setApplicationMenu(buildAppMenu(null, { onLoadROM, onReset, onSetSpeed, onSetCPU }));
 
-  // Delay auto-load until the renderer is ready to receive IPC events
-  launcherWindow.webContents.once("did-finish-load", tryAutoLoadROM);
+  if (parseAppArg()) {
+    // Launching a specific app: show launcher window for status/error feedback
+    launcherWindow = createLauncherWindow();
+    launcherWindow.on("closed", () => { launcherWindow = null; });
+    launcherWindow.webContents.once("did-finish-load", tryAutoLoadROM);
+  } else {
+    // No specific app: go straight to programs browser, no launcher needed
+    tryAutoLoadROM();
+  }
 
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) {
-      launcherWindow = createLauncherWindow();
+      if (parseAppArg()) {
+        launcherWindow = createLauncherWindow();
+        launcherWindow.on("closed", () => { launcherWindow = null; });
+        launcherWindow.webContents.once("did-finish-load", tryAutoLoadROM);
+      } else {
+        programsBrowserWindow = createProgramsBrowserWindow();
+      }
     }
   });
 });

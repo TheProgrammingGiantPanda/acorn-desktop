@@ -143,12 +143,53 @@ export class MEMC {
     const pageMask  = (1 << pageShift) - 1;
     const lpn       = logical >>> pageShift;
 
-    if (lpn >= this.maxCamEntries) return null;
+    if (lpn >= this.maxCamEntries) {
+      // Above the MEMC logical window (always 512 KB regardless of page size).
+      // Real RISC OS handles this with OS-level page-fault remapping; our
+      // emulator instead extends the mapping linearly so AIF compressed
+      // binaries can reach decompressed code above the 512 KB boundary.
+      return PHYS_RAM_BASE + logical;
+    }
 
     const entry = this.cam[lpn];
     if (!entry?.valid) return null;
 
     return PHYS_RAM_BASE + (entry.ppn << pageShift) + (logical & pageMask);
+  }
+
+  /**
+   * Ensure every logical page in [logicalBase, logicalBase+size) has a valid
+   * CAM entry.  Any currently-unmapped logical page is assigned the next
+   * available physical page number above all currently-used PPNs.
+   *
+   * Call from startApp() after the ROM boot to guarantee the application slot
+   * is accessible.  If the ROM already mapped all required pages this is a
+   * no-op.
+   */
+  forceMapRange(logicalBase: number, size: number, maxPPN: number): void {
+    const s         = this.pageSizeIndex;
+    const pageShift = 12 + s;
+    const pageSize  = 1 << pageShift;
+
+    // Find the highest PPN currently in any CAM entry.
+    let nextPPN = 0;
+    for (const entry of this.cam) {
+      if (entry.valid && entry.ppn >= nextPPN) nextPPN = entry.ppn + 1;
+    }
+
+    const firstLPN = logicalBase >>> pageShift;
+    const numPages = Math.ceil(size / pageSize);
+
+    for (let i = 0; i < numPages; i++) {
+      const lpn = firstLPN + i;
+      if (lpn >= this.maxCamEntries) break;
+      const entry = this.cam[lpn];
+      if (!entry?.valid) {
+        if (nextPPN < maxPPN) {
+          this.cam[lpn] = { valid: true, ppn: nextPPN++, ppl: 0 };
+        }
+      }
+    }
   }
 
   reset(): void {

@@ -367,6 +367,19 @@ export class WimpManager {
       icon.text = readString(bus, blockAddr + 24, 12);
     }
 
+    if (winHandle === -2) {
+      // Iconbar icon: extract sprite name from validation ("Sspritename") or text
+      let sprite = "application";
+      if (icon.validation && (icon.validation[0] === 'S' || icon.validation[0] === 's')) {
+        sprite = icon.validation.slice(1);
+      } else if (icon.text) {
+        sprite = icon.text;
+      }
+      this.host.setIconbarEntry(iconHandle, sprite, icon.text || sprite);
+      regs.write(0, iconHandle);
+      return;
+    }
+
     const win = this.windows.get(winHandle);
     if (win) {
       win.icons.set(iconHandle, icon);
