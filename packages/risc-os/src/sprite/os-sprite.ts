@@ -93,15 +93,22 @@ export class OSSpriteHandler {
   }
 
   /**
-   * Reasons 10/11: load or merge a sprite file.
+   * Reasons 10 (load) and 11 (merge): load a sprite file.
    *
-   * System/Wimp area: parse file data directly into the pool.
+   * Reason 10 replaces: clears the pool (or ARM memory area) before loading.
+   * Reason 11 merges:   adds/replaces by name, keeping existing sprites.
+   *   For user areas, reason 11 currently overwrites the ARM memory block
+   *   rather than properly merging sprite-by-sprite — see GitHub issue #21.
+   *
+   * System/Wimp area: operate on the in-memory pool directly.
    * User area (R0 & 0x100): write file bytes into ARM memory at R1+4
-   * (after the preserved area-size word); fail with C=1 if the area is too
-   * small to hold the file.  The registry cache is invalidated automatically.
+   * (after the preserved area-size word); fail with C=1 if too small.
    */
   private loadFile(pool: SpritePool, r0: number, regs: Regs, bus: Bus): void {
     if (!this.fs) return;
+    const reason   = r0 & 0xFF;
+    const userArea = (r0 & 0x100) !== 0;
+
     const path = readCString(bus, regs.read(2));
     let fileData: Uint8Array;
     try {
@@ -111,14 +118,17 @@ export class OSSpriteHandler {
       return;
     }
 
-    if (r0 & 0x100) {
-      // User area: write into ARM memory; registry invalidates its cache
+    if (userArea) {
+      // User area: write into ARM memory; registry invalidates its cache.
+      // Reason 11 (merge) should ideally append into existing area memory —
+      // tracked in issue #21; for now it replaces like reason 10.
       if (!this.registry.loadFileIntoUser(regs.read(1), fileData, bus)) {
         regs.C = true;  // area too small
         return;
       }
     } else {
-      // System or Wimp area: load directly into the in-memory pool
+      // System / Wimp area: operate on the in-memory pool.
+      if (reason === 10) pool.clear();  // load replaces; merge does not
       pool.loadArea(fileData);
     }
 

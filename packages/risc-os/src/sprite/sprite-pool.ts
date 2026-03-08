@@ -104,6 +104,11 @@ export class SpritePool {
     }
   }
 
+  /** Remove all sprites from the pool (used by OS_SpriteOp 10 load-replace). */
+  clear(): void {
+    this.sprites.clear();
+  }
+
   get(name: string): SpriteData | undefined {
     return this.sprites.get(name.toLowerCase());
   }
