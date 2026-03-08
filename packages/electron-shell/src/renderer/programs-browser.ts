@@ -3,7 +3,13 @@
  * Shows !App directories from assets/programs/ as icon tiles.
  */
 
-import type { AppEntry } from "@theprogramminggiantpanda/shared";
+export {};
+
+interface AppEntry {
+  name:        string;
+  displayName: string;
+  sprite?: { rgba: number[]; width: number; height: number };
+}
 
 declare global {
   interface Window {
@@ -18,7 +24,7 @@ declare global {
 
 const grid      = document.getElementById("grid")!;
 const emptyEl   = document.getElementById("empty")!;
-const statusbar = document.getElementById("statusbar")!;
+const statusEl = document.getElementById("statusbar") as HTMLElement;
 
 /** Convert a flat RGBA array + dimensions to a 34×34 canvas data URL. */
 function spriteToDataURL(rgba: number[], width: number, height: number): string {
@@ -79,17 +85,17 @@ function buildTile(app: AppEntry): HTMLElement {
     if (selectedTile) selectedTile.classList.remove("selected");
     tile.classList.add("selected");
     selectedTile = tile;
-    statusbar.textContent = app.name;
+    statusEl.textContent = app.name;
   });
 
   tile.addEventListener("dblclick", async () => {
-    statusbar.textContent = `Launching ${app.name}…`;
+    statusEl.textContent = `Launching ${app.name}…`;
     tile.style.opacity = "0.6";
     try {
       await window.programsBrowser.launchApp(app.name);
-      statusbar.textContent = `${app.name} launched`;
+      statusEl.textContent = `${app.name} launched`;
     } catch (err) {
-      statusbar.textContent = `Error: ${String(err)}`;
+      statusEl.textContent = `Error: ${String(err)}`;
     } finally {
       tile.style.opacity = "";
     }
@@ -99,7 +105,7 @@ function buildTile(app: AppEntry): HTMLElement {
 }
 
 async function refresh(): Promise<void> {
-  statusbar.textContent = "Loading…";
+  statusEl.textContent = "Loading…";
   try {
     const apps = await window.programsBrowser.listApps();
     grid.innerHTML = "";
@@ -107,7 +113,7 @@ async function refresh(): Promise<void> {
 
     if (apps.length === 0) {
       emptyEl.classList.add("visible");
-      statusbar.textContent = "No applications found";
+      statusEl.textContent = "No applications found";
       return;
     }
     emptyEl.classList.remove("visible");
@@ -115,9 +121,9 @@ async function refresh(): Promise<void> {
     for (const app of apps) {
       grid.appendChild(buildTile(app));
     }
-    statusbar.textContent = `${apps.length} application${apps.length === 1 ? "" : "s"}`;
+    statusEl.textContent = `${apps.length} application${apps.length === 1 ? "" : "s"}`;
   } catch (err) {
-    statusbar.textContent = `Error: ${String(err)}`;
+    statusEl.textContent = `Error: ${String(err)}`;
   }
 }
 
@@ -136,13 +142,13 @@ document.addEventListener("drop", async (e) => {
   const file = e.dataTransfer?.files[0];
   if (!file) return;
   const filePath = (file as File & { path: string }).path;
-  statusbar.textContent = `Installing ${file.name}…`;
+  statusEl.textContent = `Installing ${file.name}…`;
   const result = await window.programsBrowser.installApp(filePath);
   if (result.ok) {
-    statusbar.textContent = `Installed ${file.name}`;
+    statusEl.textContent = `Installed ${file.name}`;
     await refresh();
   } else {
-    statusbar.textContent = `Install failed: ${result.error ?? "unknown error"}`;
+    statusEl.textContent = `Install failed: ${result.error ?? "unknown error"}`;
   }
 });
 

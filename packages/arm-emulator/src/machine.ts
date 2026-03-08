@@ -29,6 +29,7 @@ export class ArchimedesMachine {
   mhz = 0;
   private cycleSnapshot = 0;
   private lastMeasure   = 0;
+  private _dataAbortCount = 0;
 
   constructor(private readonly config: MachineConfig) {
     this.memc = new MEMC();
@@ -48,7 +49,14 @@ export class ArchimedesMachine {
 
     this.ioc.onIRQ = () => this.cpu.triggerIRQ();
     this.ioc.onFIQ = () => this.cpu.triggerFIQ();
-    this.bus.onDataAbort = () => this.cpu.triggerDataAbort();
+    this.bus.onDataAbort = () => {
+      if (this.cpu.swiTraceEnabled && this._dataAbortCount < 5) {
+        this._dataAbortCount++;
+        const pc = this.cpu.regs.pc.toString(16).padStart(8, '0');
+        process.stdout.write(`[data abort #${this._dataAbortCount}] PC=0x${pc}\n`);
+      }
+      this.cpu.triggerDataAbort();
+    };
   }
 
   loadROM(data: Uint8Array): void {
@@ -103,6 +111,79 @@ export class ArchimedesMachine {
     this.lastMeasure   = Date.now();
   }
 
+  /**
+   * Load a RISC OS ARM binary into application space without disturbing the
+   * MEMC/IOC state from the ROM boot.  The binary is written to the physical
+   * RAM that the current MEMC mapping assigns to `logicalAddr`, so the OS page
+   * tables remain intact.  Only the CPU program counter and mode are changed.
+   */
+  startApp(data: Uint8Array, logicalAddr = 0x8000): void {
+    this.stop();
+
+    // Ensure the application slot has valid MEMC mappings for the full Wimp
+    // slot.  After ROM boot the OS should have mapped application space, but if
+    // any pages are missing we fill them in using the next available physical
+    // pages so the AIF decompressor can write the decompressed image.
+    const maxPPN = Math.floor(this.config.ramSize / this.memc.pageSize);
+    this.memc.forceMapRange(logicalAddr, 512 * 1024, maxPPN);
+
+    // Resolve the physical RAM offset using the ROM's current MEMC mapping.
+    const phys = this.memc.translateAddress(logicalAddr);
+    const writeDest = phys !== null ? phys : logicalAddr;
+    // Release the ROM alias so logical addresses < rom.length go through MEMC/RAM
+    // rather than returning ROM data. The ROM boot has already completed.
+    this.bus.releaseROMAlias();
+
+    // Install minimal exception handlers at the physical RAM backing logical 0x00.
+    // The ROM relied on the ROM alias for exception handling; after releasing it,
+    // those vectors are zeros which cause infinite zero-RAM traversal on any fault.
+    // MOVS PC, R14 (0xE1B0F00E) = return from exception, skipping the faulted instr.
+    // B .         (0xEAFFFFFE) = infinite loop (halt) for vectors we never expect.
+    const vecPhys = this.memc.translateAddress(0);
+    if (vecPhys !== null) {
+      const MOVS_PC_R14 = 0xE1B0F00E;
+      const B_SELF      = 0xEAFFFFFE;
+      const writeVec = (logOff: number, instr: number) => {
+        this.bus.dmaWrite(vecPhys + logOff, new Uint8Array([
+          instr & 0xFF, (instr >>> 8) & 0xFF, (instr >>> 16) & 0xFF, (instr >>> 24) & 0xFF,
+        ]));
+      };
+      writeVec(0x00, B_SELF);       // Reset — should never fire
+      writeVec(0x04, B_SELF);       // Undefined instruction — halt
+      writeVec(0x08, MOVS_PC_R14); // SWI — return (our JS handler intercepts first)
+      writeVec(0x0C, MOVS_PC_R14); // Prefetch abort — skip
+      writeVec(0x10, MOVS_PC_R14); // Data abort — skip faulted instruction
+      writeVec(0x14, B_SELF);       // Reserved — halt
+      writeVec(0x18, MOVS_PC_R14); // IRQ — return
+      writeVec(0x1C, MOVS_PC_R14); // FIQ — return
+    }
+
+    this.bus.dmaWrite(writeDest, data);
+
+    // Switch CPU to User mode (mode bits = 0) and set the entry point.
+    // Preserve flags in R15; only update mode and PC.
+    this.cpu.regs.r15 = (this.cpu.regs.r15 & ~0x03) >>> 0; // clear mode bits → User
+    this.cpu.regs.pc  = logicalAddr;
+
+    // Set up registers as RISC OS would before calling an ARM application.
+    // R13 (SP): stack pointer — top of a 32 KB Wimp slot (0x8000 + 32KB = 0x10000)
+    // R5:       secondary frame pointer used by some Acorn C runtime stubs
+    // R14 (LR): return address — 0 causes the CPU to halt via the Reset vector
+    const APP_STACK_TOP = logicalAddr + 0x8000; // 32 KB above load address
+    this.cpu.regs.write(5,  APP_STACK_TOP);
+    this.cpu.regs.write(13, APP_STACK_TOP);
+    this.cpu.regs.write(14, 0);
+    this.cpu.halted      = false;
+    this.cpu.swiPending  = false;
+    this._dataAbortCount = 0;
+    this.cycleSnapshot   = 0;
+    this.lastMeasure     = Date.now();
+
+    this.running = true;
+    this.paused  = false;
+    this.scheduleTick();
+  }
+
   start(): void {
     this.running = true;
     this.paused  = false;
@@ -127,7 +208,7 @@ export class ArchimedesMachine {
     if (this.running && !this.paused) this.scheduleTick();
   }
 
-  private scheduleTick(): void {
+  scheduleTick(): void {
     this.tickHandle = setTimeout(() => this.tick(), 0);
   }
 
@@ -140,7 +221,14 @@ export class ArchimedesMachine {
       ? STEPS_PER_TICK * 10   // uncapped
       : STEPS_PER_TICK;
 
-    this.cpu.step(steps);
+    try {
+      this.cpu.step(steps);
+    } catch (err) {
+      const pc = this.cpu.regs.pc.toString(16).padStart(8, '0');
+      process.stdout.write(`[CPU crash] PC=0x${pc} — ${err}\n`);
+      this.running = false;
+      return;
+    }
     this.ioc.tick(Math.floor((steps / clockHz) * 1_000_000));
 
     // MHz measurement

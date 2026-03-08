@@ -14,6 +14,7 @@ import { makeOSHandlers, type OutputCallback } from "./os-core.js";
 import { SystemVariables, type VarType } from "../sysvar/sysvar.js";
 import { ObeyInterpreter } from "../obey/obey.js";
 import { SpriteAreaRegistry } from "../sprite/sprite-pool.js";
+import { ModuleRegistry } from "../modules/module-registry.js";
 import { OSSpriteHandler } from "../sprite/os-sprite.js";
 import * as SWI from "../swi-numbers.js";
 
@@ -31,6 +32,7 @@ export class SwiDispatcher {
   readonly sysvar:       SystemVariables;
   readonly obey:         ObeyInterpreter;
   readonly spriteAreas:  SpriteAreaRegistry;
+  readonly modules:      ModuleRegistry;
 
   constructor(
     private readonly machine: ArchimedesMachine,
@@ -41,10 +43,12 @@ export class SwiDispatcher {
     this.wimp.setMachine(machine);
     this.sysvar      = new SystemVariables();
     this.spriteAreas = new SpriteAreaRegistry();
+    this.modules     = new ModuleRegistry();
     this.obey        = new ObeyInterpreter(options.fs, this.sysvar, {
       onOutput:    options.onOutput,
       onRunBinary: options.onRunBinary,
-      spritePool:  this.spriteAreas.system,   // IconSprites targets the system area
+      spritePool:  this.spriteAreas.system,
+      modules:     this.modules,
     });
     this.registerAll(options.onOutput ?? (() => {}), options.fs);
   }

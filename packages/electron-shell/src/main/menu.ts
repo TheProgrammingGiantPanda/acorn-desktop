@@ -11,7 +11,7 @@ interface MenuCallbacks {
   onSetCPU:  (v: "ARM2" | "ARM3") => void;
 }
 
-export function buildAppMenu(win: BrowserWindow, cb: MenuCallbacks): Menu {
+export function buildAppMenu(win: BrowserWindow | null, cb: MenuCallbacks): Menu {
   const isMac = process.platform === "darwin";
 
   const template: Electron.MenuItemConstructorOptions[] = [
@@ -58,7 +58,7 @@ export function buildAppMenu(win: BrowserWindow, cb: MenuCallbacks): Menu {
         {
           label: "Full Screen",
           accelerator: process.platform === "darwin" ? "Ctrl+Command+F" : "F11",
-          click: () => win.setFullScreen(!win.isFullScreen()),
+          click: () => win?.setFullScreen(!win.isFullScreen()),
         },
       ],
     },

@@ -85,7 +85,7 @@ export type CpuVariant = "ARM2" | "ARM3";
 
 export class ARM2CPU {
   readonly regs = new RegisterFile();
-  private halted = false;
+  halted = false;
   /** Set to true when an instruction explicitly writes the PC (branch/exception). */
   private pcExplicit = false;
   /** Total executed instruction count */
@@ -98,8 +98,10 @@ export class ARM2CPU {
 
   reset(): void {
     this.regs.reset(); // PC = 0, Supervisor mode, IRQ+FIQ disabled
-    this.halted = false;
+    this.halted     = false;
+    this.swiPending = false;
     this.cycleCount = 0;
+    this._swiSeen.clear();
   }
 
   /** Execute up to `count` instructions. Returns actual count executed. */
@@ -409,9 +411,18 @@ export class ARM2CPU {
   /** True while waiting for an async SWI (e.g. Wimp_Poll) to complete */
   swiPending = false;
 
+  /** Enable SWI call tracing to stdout */
+  swiTraceEnabled = false;
+  private _swiSeen = new Set<number>();
+
   private execSWI(instr: number): void {
     const swiNum = instr & 0x00FF_FFFF;
     const handler = this.swiHandlers.get(swiNum);
+    if (this.swiTraceEnabled && !this._swiSeen.has(swiNum)) {
+      this._swiSeen.add(swiNum);
+      const tag = handler ? "handled" : "UNHANDLED";
+      process.stdout.write(`[SWI] 0x${swiNum.toString(16).padStart(6,'0')} ${tag}\n`);
+    }
     if (handler) {
       handler(this.regs, this.bus);
     } else {

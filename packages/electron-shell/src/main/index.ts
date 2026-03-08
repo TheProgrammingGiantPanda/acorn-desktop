@@ -18,6 +18,18 @@ import { IPC } from "@theprogramminggiantpanda/shared";
 
 const isDev = !app.isPackaged;
 
+// ---------------------------------------------------------------------------
+// Asset path resolution
+// In dev, `electron .` runs from packages/electron-shell/ but assets/ lives
+// at the monorepo root (two levels up).  In a packaged app, assets are
+// bundled inside app.getAppPath().
+// ---------------------------------------------------------------------------
+function resolveAssets(...parts: string[]): string {
+  const localPath = path.join(app.getAppPath(), ...parts);
+  if (fs.existsSync(localPath)) return localPath;
+  return path.join(app.getAppPath(), "..", "..", ...parts);
+}
+
 let machine:    ArchimedesMachine | null = null;
 let dispatcher: SwiDispatcher    | null = null;
 let wimpHost:   NativeWimpHost   | null = null;
@@ -75,7 +87,7 @@ let programsBrowserWindow: BrowserWindow | null = null;
 function bootAllApps(): void {
   if (!dispatcher) return;
 
-  const programsDir = path.join(app.getAppPath(), "assets", "programs");
+  const programsDir = resolveAssets("assets", "programs");
   let entries: string[];
   try {
     entries = fs.readdirSync(programsDir);
@@ -147,7 +159,7 @@ function createProgramsBrowserWindow(): BrowserWindow {
 
 /** Scan assets/programs/ and build the app list with decoded sprites. */
 function listApps(): AppEntry[] {
-  const programsDir = path.join(app.getAppPath(), "assets", "programs");
+  const programsDir = resolveAssets("assets", "programs");
   let entries: string[] = [];
   try { entries = fs.readdirSync(programsDir); } catch { return []; }
 
@@ -192,24 +204,39 @@ function startMachine(romData: Uint8Array, appHostPath?: string): void {
 
   // When launching a specific app, root the FS at the app's parent directory
   // so the app dir is accessible as $.!AppName inside RISC OS.
-  // Otherwise use the standard ~/Documents/RISCOS root.
+  // In programs-browser mode (no appHostPath), root at assets/programs/ so
+  // dispatcher.obey.runFile("$.!AppName.!Run") resolves correctly.
   const fsRoot = appHostPath
     ? path.dirname(path.resolve(appHostPath))
-    : path.join(app.getPath("documents"), "RISCOS");
+    : resolveAssets("assets", "programs");
 
   const nodeFs = new NodeFsHost(fsRoot);
 
   machine    = new ArchimedesMachine(config);
   wimpHost   = new NativeWimpHost();
   dispatcher = new SwiDispatcher(machine, wimpHost, {
-    onOutput: (text) => launcherWindow?.webContents.send("console-output", text),
+    onOutput: (text) => {
+      process.stdout.write(`[RISC OS] ${text}`);
+      launcherWindow?.webContents.send("console-output", text);
+    },
     fs: nodeFs,
     onRunBinary: (riscosPath) => {
+      console.log(`[onRunBinary] loading: ${riscosPath}`);
       try {
+        const hostPath = nodeFs.resolvePath(riscosPath);
+        console.log(`[onRunBinary] host path: ${hostPath}`);
         const data = nodeFs.readFile(riscosPath);
-        machine!.loadProgram(data);
+        console.log(`[onRunBinary] binary size: ${data.length} bytes — restarting machine`);
+        machine!.cpu.swiTraceEnabled = true;
+        // SWI 0xADBEEF is the AIF "not yet decompressed" guard — halt cleanly.
+        machine!.cpu.swiHandlers.set(0xADBEEF, () => {
+          process.stdout.write(`[AIF] decompressor guard SWI — binary not decompressed correctly\n`);
+          machine!.cpu.halted = true;
+        });
+        machine!.startApp(data);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
+        console.error(`[onRunBinary] failed: ${msg}`);
         launcherWindow?.webContents.send(IPC.ERROR, { message: `Cannot run ${riscosPath}: ${msg}`, fatal: false });
       }
     },
@@ -347,24 +374,38 @@ ipcMain.handle(IPC.LOAD_ROM,  async (_ev, payload: { path: string }) => {
 // ---------------------------------------------------------------------------
 // Programs browser IPC
 // ---------------------------------------------------------------------------
-ipcMain.handle(IPC.BROWSER_LIST_APPS, (): AppEntry[] => listApps());
+ipcMain.handle(IPC.BROWSER_LIST_APPS, (): AppEntry[] => {
+  try {
+    return listApps();
+  } catch (err) {
+    console.error("[browser:list-apps]", err);
+    return [];
+  }
+});
 
 ipcMain.handle(IPC.BROWSER_LAUNCH_APP, (_ev, appName: string) => {
-  const programsDir = path.join(app.getAppPath(), "assets", "programs");
+  console.log(`[launch] ${appName}`);
+  const programsDir = resolveAssets("assets", "programs");
   const appHostPath = path.join(programsDir, appName);
 
-  if (!fs.existsSync(appHostPath)) return;
-  if (!dispatcher) return;
+  if (!fs.existsSync(appHostPath)) { console.error(`[launch] path not found: ${appHostPath}`); return; }
+  if (!dispatcher) { console.error(`[launch] dispatcher not ready`); return; }
 
   const programsFs = new NodeFsHost(programsDir);
   const runScript  = `$.${appName}.!Run`;
 
   if (programsFs.stat(runScript) !== null) {
+    console.log(`[launch] running obey: ${runScript}`);
     dispatcher.obey.runFile(runScript);
+    console.log(`[launch] obey complete`);
   } else {
     const runImage = `$.${appName}.!RunImage`;
+    console.log(`[launch] no !Run, trying binary: ${runImage}`);
     if (programsFs.stat(runImage) !== null) {
-      machine!.loadProgram(programsFs.readFile(runImage));
+      const data = programsFs.readFile(runImage);
+      machine!.startApp(data);
+    } else {
+      console.error(`[launch] no !Run or !RunImage found in ${appName}`);
     }
   }
 });
@@ -381,7 +422,7 @@ ipcMain.handle(IPC.BROWSER_INSTALL_APP, async (_ev, hostPath: string): Promise<{
       return { ok: false, error: "Only !App directories can be installed" };
     }
 
-    const programsDir = path.join(app.getAppPath(), "assets", "programs");
+    const programsDir = resolveAssets("assets", "programs");
     const destDir     = path.join(programsDir, name);
     fs.cpSync(hostPath, destDir, { recursive: true });
 
@@ -416,7 +457,7 @@ ipcMain.handle(IPC.BROWSER_INSTALL_APP, async (_ev, hostPath: string): Promise<{
 // Auto-load ROM from assets/roms/ on startup
 // ---------------------------------------------------------------------------
 function tryAutoLoadROM(): void {
-  const romsDir = path.join(app.getAppPath(), "assets", "roms");
+  const romsDir = resolveAssets("assets", "roms");
 
   let files: string[] = [];
   try {
@@ -451,15 +492,27 @@ function tryAutoLoadROM(): void {
 // App lifecycle
 // ---------------------------------------------------------------------------
 app.whenReady().then(() => {
-  launcherWindow = createLauncherWindow();
-  launcherWindow.on("closed", () => { launcherWindow = null; });
+  Menu.setApplicationMenu(buildAppMenu(null, { onLoadROM, onReset, onSetSpeed, onSetCPU }));
 
-  // Delay auto-load until the renderer is ready to receive IPC events
-  launcherWindow.webContents.once("did-finish-load", tryAutoLoadROM);
+  if (parseAppArg()) {
+    // Launching a specific app: show launcher window for status/error feedback
+    launcherWindow = createLauncherWindow();
+    launcherWindow.on("closed", () => { launcherWindow = null; });
+    launcherWindow.webContents.once("did-finish-load", tryAutoLoadROM);
+  } else {
+    // No specific app: go straight to programs browser, no launcher needed
+    tryAutoLoadROM();
+  }
 
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) {
-      launcherWindow = createLauncherWindow();
+      if (parseAppArg()) {
+        launcherWindow = createLauncherWindow();
+        launcherWindow.on("closed", () => { launcherWindow = null; });
+        launcherWindow.webContents.once("did-finish-load", tryAutoLoadROM);
+      } else {
+        programsBrowserWindow = createProgramsBrowserWindow();
+      }
     }
   });
 });
