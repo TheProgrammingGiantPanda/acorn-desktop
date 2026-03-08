@@ -63,20 +63,18 @@ window.wimpWindow.onResize(resize);
 let osScrollX = 0;
 /** Work-area Y visible at the window's top edge  (= scrollY from Wimp, upward Y) */
 let osScrollY = 0;
-/** Window width in OS units (visX1 - visX0) */
-let osWinW = 1280;
-/** Window height in OS units (visY1 - visY0) */
-let osWinH = 1024;
 
-/** Translate a work-area X coordinate (OS units) to canvas pixels */
-function osX(ux: number): number {
-  return (ux - osScrollX) * canvas.width / osWinW;
-}
+/**
+ * Translate a work-area X coordinate (OS units) to canvas pixels.
+ * 2 OS units = 1 pixel — no scaling to canvas size.
+ */
+function osX(ux: number): number { return (ux - osScrollX) / 2; }
 
-/** Translate a work-area Y coordinate (OS units, upward) to canvas pixels (downward) */
-function osY(uy: number): number {
-  return (osScrollY - uy) * canvas.height / osWinH;
-}
+/**
+ * Translate a work-area Y coordinate (OS units, upward) to canvas pixels (downward).
+ * 2 OS units = 1 pixel — no scaling to canvas size.
+ */
+function osY(uy: number): number { return (osScrollY - uy) / 2; }
 
 // ---------------------------------------------------------------------------
 // Draw commands from main process
@@ -111,35 +109,28 @@ window.wimpWindow.onDraw((cmds) => {
 
       // ── OS-unit drawing (OS_Plot interception) ────────────────────────────
       case "os_setup":
-        // x=scrollX, y=scrollY, w=windowOsWidth, h=windowOsHeight
+        // x=scrollX, y=scrollY (w/h reserved for future zoom support)
         osScrollX = cmd.x;
         osScrollY = cmd.y;
-        osWinW = Math.max(1, cmd.w ?? 1);
-        osWinH = Math.max(1, cmd.h ?? 1);
         break;
 
       case "os_line": {
         // (x,y) = start, (w,h) = end — all in work-area OS units
-        const x0 = osX(cmd.x),  y0 = osY(cmd.y);
-        const x1 = osX(cmd.w ?? 0), y1 = osY(cmd.h ?? 0);
         ctx.strokeStyle = cmd.colour ?? "#000000";
         ctx.beginPath();
-        ctx.moveTo(x0, y0);
-        ctx.lineTo(x1, y1);
+        ctx.moveTo(osX(cmd.x), osY(cmd.y));
+        ctx.lineTo(osX(cmd.w ?? 0), osY(cmd.h ?? 0));
         ctx.stroke();
         break;
       }
 
       case "os_rect": {
-        // x,y = lower-left corner (OS units, Y upward), w,h = size in OS units
-        const rx  = osX(cmd.x);
-        // lower-left in OS = canvas top-left when Y is flipped:
-        //   osY(lower-left Y) gives bottom edge in canvas → subtract rect height
-        const rh  = (cmd.h ?? 0) * canvas.height / osWinH;
-        const ry  = osY((cmd.y ?? 0) + (cmd.h ?? 0));  // top of rect in canvas
-        const rw  = (cmd.w ?? 0) * canvas.width / osWinW;
+        // x,y = lower-left corner (OS units, Y upward), w,h = size in OS units.
+        // osY maps the TOP of the rect (lower-left Y + height in upward Y → top in canvas).
+        const rw = (cmd.w ?? 0) / 2;
+        const rh = (cmd.h ?? 0) / 2;
         ctx.fillStyle = cmd.colour ?? "#000000";
-        ctx.fillRect(rx, ry, rw, rh);
+        ctx.fillRect(osX(cmd.x), osY(cmd.y + (cmd.h ?? 0)), rw, rh);
         break;
       }
     }
