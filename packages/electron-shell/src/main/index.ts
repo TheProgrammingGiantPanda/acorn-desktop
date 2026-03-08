@@ -102,13 +102,13 @@ function bootAllApps(): void {
     if (programsFs.stat(bootPath) !== null) {
       const obey = new ObeyInterpreter(programsFs, dispatcher.sysvar, {
         onOutput,
-        spritePool: dispatcher.spritePool,
+        spritePool: dispatcher.spriteAreas.system,
       });
       obey.runFile(bootPath);
     } else if (programsFs.stat(spritePath) !== null) {
-      // No !Boot but has !Sprites — load sprites directly
+      // No !Boot but has !Sprites — load sprites directly into the system area
       try {
-        dispatcher.spritePool.loadArea(programsFs.readFile(spritePath));
+        dispatcher.spriteAreas.system.loadArea(programsFs.readFile(spritePath));
       } catch { /* ignore unreadable sprite files */ }
     }
   }

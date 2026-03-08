@@ -13,7 +13,7 @@ import { OSFileHandler } from "../fs/os-fs.js";
 import { makeOSHandlers, type OutputCallback } from "./os-core.js";
 import { SystemVariables, type VarType } from "../sysvar/sysvar.js";
 import { ObeyInterpreter } from "../obey/obey.js";
-import { SpritePool } from "../sprite/sprite-pool.js";
+import { SpriteAreaRegistry } from "../sprite/sprite-pool.js";
 import { OSSpriteHandler } from "../sprite/os-sprite.js";
 import * as SWI from "../swi-numbers.js";
 
@@ -27,24 +27,24 @@ export interface DispatcherOptions {
 }
 
 export class SwiDispatcher {
-  readonly wimp:        WimpManager;
-  readonly sysvar:      SystemVariables;
-  readonly obey:        ObeyInterpreter;
-  readonly spritePool:  SpritePool;
+  readonly wimp:         WimpManager;
+  readonly sysvar:       SystemVariables;
+  readonly obey:         ObeyInterpreter;
+  readonly spriteAreas:  SpriteAreaRegistry;
 
   constructor(
     private readonly machine: ArchimedesMachine,
     host: NativeHost,
     options: DispatcherOptions = {},
   ) {
-    this.wimp       = new WimpManager(host);
+    this.wimp        = new WimpManager(host);
     this.wimp.setMachine(machine);
-    this.sysvar     = new SystemVariables();
-    this.spritePool = new SpritePool();
-    this.obey       = new ObeyInterpreter(options.fs, this.sysvar, {
+    this.sysvar      = new SystemVariables();
+    this.spriteAreas = new SpriteAreaRegistry();
+    this.obey        = new ObeyInterpreter(options.fs, this.sysvar, {
       onOutput:    options.onOutput,
       onRunBinary: options.onRunBinary,
-      spritePool:  this.spritePool,
+      spritePool:  this.spriteAreas.system,   // IconSprites targets the system area
     });
     this.registerAll(options.onOutput ?? (() => {}), options.fs);
   }
@@ -165,7 +165,7 @@ export class SwiDispatcher {
       (r, b) => { void w.reportError(r, b); });
 
     // ── Sprite operations ─────────────────────────────────────────────────────
-    const spriteHandler = new OSSpriteHandler(this.spritePool, fs);
+    const spriteHandler = new OSSpriteHandler(this.spriteAreas, fs);
     cpu.swiHandlers.set(SWI.OS_SpriteOp,  (r, b) => spriteHandler.handleOS(r, b));
     cpu.swiHandlers.set(SWI.Wimp_SpriteOp,(r, b) => spriteHandler.handleWimp(r, b));
 
