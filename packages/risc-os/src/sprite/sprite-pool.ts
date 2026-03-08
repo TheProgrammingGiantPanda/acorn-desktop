@@ -42,19 +42,35 @@ export class SpritePool {
   private readonly sprites = new Map<string, SpriteData>();
 
   /**
-   * Parse a RISC OS sprite area from file data and add all sprites to the pool.
+   * Parse a RISC OS sprite area from a file.
+   * File format omits the area-size word, so stored offsets are 4 bytes larger
+   * than file-relative positions.
    * Sprites with duplicate names replace earlier ones.
    */
   loadArea(data: Uint8Array): void {
     if (data.length < 12) return;
-
-    const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
-
-    // File omits the area-size word → stored offsets are 4 greater than file offsets
+    const view           = new DataView(data.buffer, data.byteOffset, data.byteLength);
     const numSprites     = view.getUint32(0, true);
-    const firstSpriteOff = view.getUint32(4, true) - 4;   // convert to file-relative
+    const firstSpriteOff = view.getUint32(4, true) - 4;  // convert to file-relative
+    this._parse(view, data, numSprites, firstSpriteOff);
+  }
 
-    let off = firstSpriteOff;
+  /**
+   * Parse a RISC OS sprite area from ARM memory.
+   * Memory format includes the area-size word at +0, so the layout is:
+   *   +0  area size  +4  num sprites  +8  first sprite offset  +12  free offset
+   * Offsets are area-relative (no adjustment needed).
+   */
+  loadAreaFromMemory(data: Uint8Array): void {
+    if (data.length < 16) return;
+    const view           = new DataView(data.buffer, data.byteOffset, data.byteLength);
+    const numSprites     = view.getUint32(4, true);
+    const firstSpriteOff = view.getUint32(8, true);  // area-relative, no adjustment
+    this._parse(view, data, numSprites, firstSpriteOff);
+  }
+
+  private _parse(view: DataView, data: Uint8Array, numSprites: number, firstOff: number): void {
+    let off = firstOff;
     for (let i = 0; i < numSprites; i++) {
       if (off + 44 > data.length) break;
 
@@ -69,10 +85,8 @@ export class SpritePool {
       const mode       = view.getUint32(off + 40, true);
 
       const bpp    = modeToBpp(mode);
-      // Pixel width: total row bits minus left/right waste, divided by bpp
       const width  = Math.round(((widthWords * 32) - lbit - (31 - rbit)) / bpp);
 
-      // Palette: optional block between the 44-byte header and image data
       const paletteBytes = imgOff > 44 ? imgOff - 44 : 0;
       const palette      = readPalette(data, off + 44, paletteBytes / 8, mode);
 
@@ -267,4 +281,119 @@ function decodePixels(
   }
 
   return rgba;
+}
+
+// ── SpriteAreaRegistry ────────────────────────────────────────────────────────
+
+/** Minimal bus interface needed for reading/writing ARM memory. */
+export interface SpriteBus {
+  read8(addr: number): number;
+  write8(addr: number, val: number): void;
+}
+
+interface UserEntry {
+  hash: number;
+  pool: SpritePool;
+}
+
+/**
+ * Manages separate sprite pools for each RISC OS sprite area.
+ *
+ *   system — OS system sprite area; used by OS_SpriteOp without area flag.
+ *            IconSprites does NOT use this — it targets the Wimp area.
+ *   wimp   — Wimp's own sprite area; target of Wimp_SpriteOp and IconSprites.
+ *            Separate from the OS system area.
+ *   user   — Per-application areas in ARM memory, identified by R1 (the
+ *            address of the allocated sprite area block).  The first word of
+ *            that block is the area size; subsequent words are the standard
+ *            in-memory sprite area header (num_sprites, first_off, free_off).
+ *
+ * OS_SpriteOp R0 area bits:
+ *   R0 & 0x100 = 0 → system area
+ *   R0 & 0x100 = 1 → user area (R1 = ARM memory pointer)
+ */
+export class SpriteAreaRegistry {
+  /** OS system sprite area — OS_SpriteOp without area flag. */
+  readonly system = new SpritePool();
+
+  /**
+   * Wimp sprite area — Wimp_SpriteOp and IconSprites.
+   * This is a separate area from system; the Wimp allocates and manages it.
+   */
+  readonly wimp   = new SpritePool();
+
+  private readonly userCache = new Map<number, UserEntry>();
+
+  /**
+   * Get the decoded pool for a user sprite area at the given ARM memory pointer.
+   *
+   * Reads the area size from ptr+0, snapshots the full area, computes a hash,
+   * and re-parses only when the content has changed since last call.
+   */
+  getUserPool(ptr: number, bus: SpriteBus): SpritePool {
+    const size = readWord(bus, ptr);
+    if (size < 16) return new SpritePool();  // area not yet initialised
+
+    // Cap at 4 MB to guard against uninitialised memory with a huge size word
+    const safeSize = Math.min(size, 4 * 1024 * 1024);
+    const data     = readBytesFromBus(bus, ptr, safeSize);
+    const hash     = hashBytes(data);
+
+    const cached = this.userCache.get(ptr);
+    if (cached && cached.hash === hash) return cached.pool;
+
+    const pool = new SpritePool();
+    pool.loadAreaFromMemory(data);
+    this.userCache.set(ptr, { hash, pool });
+    return pool;
+  }
+
+  /**
+   * Load a sprite file into a user area in ARM memory.
+   *
+   * The area's size word (ptr+0) must be large enough to hold 4 header bytes
+   * plus the file data.  File data is written starting at ptr+4 (after the
+   * preserved size word).  The user-area cache is invalidated so the next
+   * call to getUserPool re-parses from the updated memory.
+   *
+   * Returns true on success, false if the area is too small.
+   */
+  loadFileIntoUser(ptr: number, fileData: Uint8Array, bus: SpriteBus): boolean {
+    const areaSize = readWord(bus, ptr);
+    if (fileData.length + 4 > areaSize) return false;
+
+    for (let i = 0; i < fileData.length; i++) bus.write8(ptr + 4 + i, fileData[i]!);
+    this.userCache.delete(ptr);  // force re-parse on next access
+    return true;
+  }
+
+  /**
+   * Select the pool for an OS_SpriteOp call from R0 and R1.
+   * R0 bit 8 set → user area at R1 in ARM memory; clear → system area.
+   */
+  forOS(r0: number, r1: number, bus: SpriteBus): SpritePool {
+    return (r0 & 0x100) ? this.getUserPool(r1, bus) : this.system;
+  }
+}
+
+// ── ARM memory helpers ────────────────────────────────────────────────────────
+
+function readWord(bus: SpriteBus, addr: number): number {
+  return (  bus.read8(addr)
+          | bus.read8(addr + 1) << 8
+          | bus.read8(addr + 2) << 16
+          | bus.read8(addr + 3) << 24) >>> 0;
+}
+
+function readBytesFromBus(bus: SpriteBus, addr: number, size: number): Uint8Array {
+  const data = new Uint8Array(size);
+  for (let i = 0; i < size; i++) data[i] = bus.read8(addr + i);
+  return data;
+}
+
+/** Simple polynomial hash — fast enough to detect area mutations between calls. */
+function hashBytes(data: Uint8Array): number {
+  let h = 0;
+  for (const b of data) h = (Math.imul(h, 31) + b) | 0;
+  return h;
 }
