@@ -218,11 +218,9 @@ export class ArchimedesMachine {
    * this method.
    */
   bootROM(): void {
+    this.reset();
     this.running   = true;
     this.paused    = false;
-    this.romBooted = true;
-    this.reset();
-    // reset() clears romBooted — re-assert it after reset.
     this.romBooted = true;
     this.scheduleTick();
   }

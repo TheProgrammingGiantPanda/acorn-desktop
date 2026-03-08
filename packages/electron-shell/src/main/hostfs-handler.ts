@@ -223,7 +223,7 @@ export class HostFsHandler {
         const start    = regs.read(4) >>> 0;
         const end      = regs.read(5) >>> 0;
         const fileType = extractFileType(loadAddr);
-        const leaf     = path.basename(native);
+        const leaf     = parseTypeSuffix(path.basename(native)).baseName;
         const dir      = path.dirname(native);
         const savePath = this.saveNativePath(dir, leaf, fileType);
         const len      = end > start ? end - start : 0;
@@ -562,5 +562,9 @@ export class HostFsHandler {
     machine.registerSWI(SWI_OS_ARGS,      (r, b) => this.handleOsArgs(r, b));
     machine.registerSWI(SWI_OS_GBPB,      (r, b) => this.handleOsGBPB(r, b));
     machine.registerSWI(SWI_OS_FSCONTROL, (r, b) => this.handleOsFsControl(r, b));
+    // TODO: intercept OS_BGet (0x0A) and OS_BPut (0x0B) for HostFS handles 200–254.
+    // Currently those SWIs fall through to the ROM's FileSwitch, which won't recognise
+    // our handle numbers.  In practice apps use GBPB for bulk I/O so this rarely bites,
+    // but single-byte reads/writes to HostFS handles will silently fail until fixed.
   }
 }
