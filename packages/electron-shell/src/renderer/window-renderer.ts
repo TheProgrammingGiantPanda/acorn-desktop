@@ -16,13 +16,13 @@ declare global {
       onDraw:  (cb: (cmds: DrawCommand[]) => void) => void;
       onUpdateIcon: (cb: (data: { iconHandle: number; icon: IconData }) => void) => void;
       onResize: (cb: () => void) => void;
-      onPixels: (cb: (data: { width: number; height: number; pixels: Uint8Array }) => void) => void;
     };
   }
 }
 
 interface DrawCommand {
-  type: "fillRect" | "strokeRect" | "text" | "line" | "clear" | "sprite";
+  type: "fillRect" | "strokeRect" | "text" | "line" | "clear" | "sprite"
+      | "os_setup" | "os_line" | "os_rect";
   x: number; y: number;
   w?: number; h?: number;
   text?: string;
@@ -55,11 +55,36 @@ window.addEventListener("resize", resize);
 window.wimpWindow.onResize(resize);
 
 // ---------------------------------------------------------------------------
+// OS-unit coordinate translation state
+// Populated by the "os_setup" draw command before each redraw batch.
+// ---------------------------------------------------------------------------
+
+/** Work-area X visible at the window's left edge (= scrollX from Wimp) */
+let osScrollX = 0;
+/** Work-area Y visible at the window's top edge  (= scrollY from Wimp, upward Y) */
+let osScrollY = 0;
+/** Window width in OS units (visX1 - visX0) */
+let osWinW = 1280;
+/** Window height in OS units (visY1 - visY0) */
+let osWinH = 1024;
+
+/** Translate a work-area X coordinate (OS units) to canvas pixels */
+function osX(ux: number): number {
+  return (ux - osScrollX) * canvas.width / osWinW;
+}
+
+/** Translate a work-area Y coordinate (OS units, upward) to canvas pixels (downward) */
+function osY(uy: number): number {
+  return (osScrollY - uy) * canvas.height / osWinH;
+}
+
+// ---------------------------------------------------------------------------
 // Draw commands from main process
 // ---------------------------------------------------------------------------
 window.wimpWindow.onDraw((cmds) => {
   for (const cmd of cmds) {
     switch (cmd.type) {
+      // ── Canvas-pixel drawing (icon renderer etc.) ─────────────────────────
       case "clear":
         drawBackground();
         break;
@@ -83,6 +108,40 @@ window.wimpWindow.onDraw((cmds) => {
         ctx.lineTo(cmd.w ?? 0, cmd.h ?? 0);
         ctx.stroke();
         break;
+
+      // ── OS-unit drawing (OS_Plot interception) ────────────────────────────
+      case "os_setup":
+        // x=scrollX, y=scrollY, w=windowOsWidth, h=windowOsHeight
+        osScrollX = cmd.x;
+        osScrollY = cmd.y;
+        osWinW = Math.max(1, cmd.w ?? 1);
+        osWinH = Math.max(1, cmd.h ?? 1);
+        break;
+
+      case "os_line": {
+        // (x,y) = start, (w,h) = end — all in work-area OS units
+        const x0 = osX(cmd.x),  y0 = osY(cmd.y);
+        const x1 = osX(cmd.w ?? 0), y1 = osY(cmd.h ?? 0);
+        ctx.strokeStyle = cmd.colour ?? "#000000";
+        ctx.beginPath();
+        ctx.moveTo(x0, y0);
+        ctx.lineTo(x1, y1);
+        ctx.stroke();
+        break;
+      }
+
+      case "os_rect": {
+        // x,y = lower-left corner (OS units, Y upward), w,h = size in OS units
+        const rx  = osX(cmd.x);
+        // lower-left in OS = canvas top-left when Y is flipped:
+        //   osY(lower-left Y) gives bottom edge in canvas → subtract rect height
+        const rh  = (cmd.h ?? 0) * canvas.height / osWinH;
+        const ry  = osY((cmd.y ?? 0) + (cmd.h ?? 0));  // top of rect in canvas
+        const rw  = (cmd.w ?? 0) * canvas.width / osWinW;
+        ctx.fillStyle = cmd.colour ?? "#000000";
+        ctx.fillRect(rx, ry, rw, rh);
+        break;
+      }
     }
   }
 });
@@ -149,13 +208,3 @@ function specialKey(key: string): number {
   return map[key] ?? -1;
 }
 
-// ---------------------------------------------------------------------------
-// VIDC frame buffer pixels from main process
-// ---------------------------------------------------------------------------
-window.wimpWindow.onPixels(({ width, height, pixels }) => {
-  const rgba = new Uint8ClampedArray(pixels.buffer, pixels.byteOffset, pixels.byteLength);
-  const imageData = new ImageData(rgba, width, height);
-  canvas.width  = width;
-  canvas.height = height;
-  ctx.putImageData(imageData, 0, 0);
-});

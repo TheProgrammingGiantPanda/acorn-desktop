@@ -25,7 +25,4 @@ contextBridge.exposeInMainWorld("wimpWindow", {
   onResize: (callback: () => void) => {
     ipcRenderer.on("wimp-resize", () => callback());
   },
-  onPixels: (callback: (data: { width: number; height: number; pixels: Uint8Array }) => void) => {
-    ipcRenderer.on("wimp-pixels", (_, data) => callback(data));
-  },
 });

@@ -140,13 +140,6 @@ export class NativeWimpHost implements NativeHost {
     this.windows.get(winHandle)?.webContents.send("wimp-draw", cmds);
   }
 
-  updateWindowPixels(handle: number, pixels: Uint8ClampedArray, width: number, height: number): void {
-    const win = this.windows.get(handle);
-    if (win && !win.isDestroyed()) {
-      win.webContents.send("wimp-pixels", { width, height, pixels: Buffer.from(pixels.buffer, pixels.byteOffset, pixels.byteLength) });
-    }
-  }
-
   async showMenu(title: string, items: NativeMenuItem[], x: number, y: number): Promise<number[] | null> {
     return new Promise((resolve) => {
       const menu = Menu.buildFromTemplate(

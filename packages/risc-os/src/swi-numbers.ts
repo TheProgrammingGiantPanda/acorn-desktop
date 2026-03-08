@@ -44,6 +44,7 @@ export const OS_ValidateAddress = 0x000003A;
 export const OS_CallASWI     = 0x00006F;
 export const OS_CallASWIR12  = 0x000071;
 export const OS_PlatformFeatures = 0x06D;
+export const OS_SetColour        = 0x000061;
 
 // Wimp SWIs
 export const Wimp_Initialise      = 0x400C0;

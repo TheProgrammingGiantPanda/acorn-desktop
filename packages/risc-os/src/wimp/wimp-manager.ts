@@ -118,6 +118,17 @@ export class WimpManager {
   private taskHandle = 0;
   private machine!: ArchimedesMachine;
 
+  // ── OS_Plot / VDU drawing state ────────────────────────────────────────────
+  /** Handle of the window currently being redrawn, or null when not in a redraw loop */
+  private currentRedrawHandle: number | null = null;
+  /** Current graphics cursor in OS units (absolute screen coordinates) */
+  private graphicsX = 0;
+  private graphicsY = 0;
+  /** Current foreground draw colour as a CSS string */
+  private fgColour = "#000000";
+  /** Batch of draw commands accumulated during one redraw cycle */
+  private pendingCmds: import("./native-host.js").DrawCommand[] = [];
+
   constructor(private readonly host: NativeHost) {}
 
   setMachine(m: ArchimedesMachine): void { this.machine = m; }
@@ -217,37 +228,101 @@ export class WimpManager {
     const blockAddr = regs.read(1);
     const handle    = bus.read32(blockAddr) | 0;
     const win       = this.windows.get(handle);
-    if (win) {
-      writeWindowState(bus, blockAddr, win);
-      regs.write(0, 1); // non-zero = there is a rectangle to redraw
-    } else {
-      regs.write(0, 0); // unknown window — nothing to draw
+    if (!win) {
+      regs.write(0, 0);
+      return;
     }
+    writeWindowState(bus, blockAddr, win);
+    regs.write(0, 1); // non-zero = there is a rectangle to redraw
+
+    // Begin OS_Plot capture for this window.
+    // os_setup encodes scroll/size so the renderer can translate work-area
+    // OS-unit coordinates (as sent via OS_Plot when VDU origin = 0) to canvas px.
+    this.currentRedrawHandle = handle;
+    this.pendingCmds = [
+      {
+        type: "os_setup",
+        x: win.def.scrollX,                          // work-area X at left edge
+        y: win.def.scrollY,                          // work-area Y at top edge
+        w: win.def.visX1 - win.def.visX0,            // window width in OS units
+        h: win.def.visY1 - win.def.visY0,            // window height in OS units
+      },
+      { type: "clear", x: 0, y: 0 },
+    ];
   }
 
   /**
    * Wimp_GetRectangle (SWI 0x400CA) — advances the redraw loop.
    *
-   * We always return R0=0 (no more rectangles) since we give apps one
-   * dirty rect per redraw event.  Before returning we capture the window's
-   * region from the VIDC frame buffer and push the pixels to the native canvas.
+   * We always return R0=0 (no more rectangles).  Before returning we flush
+   * all batched OS_Plot draw commands to the native window canvas.
    */
-  getWindowRect(regs: RegisterFile, bus: SystemBus): void {
-    const blockAddr = regs.read(1);
-    const handle    = bus.read32(blockAddr) | 0;
-    const win       = this.windows.get(handle);
-
+  getWindowRect(regs: RegisterFile, _bus: SystemBus): void {
     regs.write(0, 0); // no more rectangles
 
-    if (win?.open) {
-      const result = this.machine.captureWindowRegion(
-        win.def.visX0, win.def.visY0, win.def.visX1, win.def.visY1,
-      );
-      if (result) {
-        this.host.updateWindowPixels(handle, result.pixels, result.width, result.height);
+    if (this.currentRedrawHandle !== null && this.pendingCmds.length > 0) {
+      void this.host.draw(this.currentRedrawHandle, this.pendingCmds);
+    }
+    this.pendingCmds = [];
+    this.currentRedrawHandle = null;
+  }
+
+  // ── OS_Plot interception ───────────────────────────────────────────────────
+
+  /**
+   * Handle an OS_Plot call from the ARM CPU.
+   *
+   * Plot code encoding (RISC OS PRM Vol 1):
+   *   bit 2        : 0 = relative coordinates, 1 = absolute
+   *   bits 1:0     : draw action — 0 = move only, 1–3 = draw (EOR/FG/BG)
+   *   bits 7:3     : operation type (0=line, 12=filled rect, etc.)
+   */
+  osPlot(code: number, x: number, y: number): void {
+    if (this.currentRedrawHandle === null) return;
+
+    const absolute   = !!(code & 4);
+    const drawAction = code & 3;        // 0 = move only, non-zero = draw
+    const opType     = (code >>> 3) & 0x1F;
+
+    const absX = absolute ? x : this.graphicsX + x;
+    const absY = absolute ? y : this.graphicsY + y;
+
+    if (drawAction !== 0) {
+      switch (opType) {
+        case 0: // Line to point
+          this.pendingCmds.push({
+            type: "os_line",
+            x: this.graphicsX, y: this.graphicsY,
+            w: absX, h: absY,
+            colour: this.fgColour,
+          });
+          break;
+
+        case 12: // Filled rectangle — previous point and current point are corners
+          this.pendingCmds.push({
+            type: "os_rect",
+            x: Math.min(this.graphicsX, absX),
+            y: Math.min(this.graphicsY, absY),
+            w: Math.abs(absX - this.graphicsX),
+            h: Math.abs(absY - this.graphicsY),
+            colour: this.fgColour,
+          });
+          break;
+
+        default:
+          // Unsupported operation type — move cursor but do not draw
+          break;
       }
     }
+
+    this.graphicsX = absX;
+    this.graphicsY = absY;
   }
+
+  /** Set the current graphics foreground colour (called by OS_SetColour handler) */
+  setGraphicsFgColour(css: string): void { this.fgColour = css; }
+  /** Set the current graphics background colour (currently unused in rendering) */
+  setGraphicsBgColour(_css: string): void { /* background draw ops not yet implemented */ }
 
   /** Wimp_GetWindowState (SWI 0x400CB) */
   getWindowState(regs: RegisterFile, bus: SystemBus): void {

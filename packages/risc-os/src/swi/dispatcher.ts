@@ -215,6 +215,50 @@ export class SwiDispatcher {
 
     // Font_* SWIs passthrough to ROM — the ROM's font manager handles them.
 
+    // ── Graphics interception (OS_Plot / OS_SetColour) ────────────────────────
+    //
+    // We intercept OS_Plot to build per-window canvas draw commands during
+    // Wimp redraw loops.  OS_SetColour lets us track the current draw colour.
+    // All other VDU/graphics calls passthrough to ROM.
+
+    cpu.swiHandlers.set(SWI.OS_Plot, (regs) => {
+      const code = regs.read(0);
+      const x    = regs.read(1) | 0; // signed 32-bit
+      const y    = regs.read(2) | 0;
+      this.wimp.osPlot(code, x, y);
+      return 'passthrough'; // let ROM update its own graphics state too
+    });
+
+    cpu.swiHandlers.set(SWI.OS_SetColour, (regs) => {
+      const action = regs.read(0) >>> 0;
+      const colour = regs.read(1) >>> 0;
+
+      // colour is either a logical palette index (0–15) or a ColourTrans
+      // physical colour (&BBGGRR00: bits 31:24=B, 23:16=G, 15:8=R, 7:0=0).
+      let css: string;
+      if (colour <= 15) {
+        // Logical colour — look up in the VIDC palette the ROM has programmed
+        const palEntry = this.machine.vidc.palette[colour] ?? 0;
+        const r = ((palEntry)       & 0xF) * 17;
+        const g = ((palEntry >>> 4) & 0xF) * 17;
+        const b = ((palEntry >>> 8) & 0xF) * 17;
+        css = `rgb(${r},${g},${b})`;
+      } else {
+        // ColourTrans physical colour &BBGGRR00
+        const r = (colour >>> 8)  & 0xFF;
+        const g = (colour >>> 16) & 0xFF;
+        const b = (colour >>> 24) & 0xFF;
+        css = `rgb(${r},${g},${b})`;
+      }
+
+      if (action & 0x80) {
+        this.wimp.setGraphicsBgColour(css);
+      } else {
+        this.wimp.setGraphicsFgColour(css);
+      }
+      return 'passthrough';
+    });
+
   }
 
   /** Inject a Wimp event from the host (e.g. user clicked a button) */

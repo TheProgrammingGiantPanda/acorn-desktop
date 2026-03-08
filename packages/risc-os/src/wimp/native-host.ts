@@ -8,7 +8,22 @@
 import type { WimpWindowDef, WimpIcon, WimpPollEvent } from "./types.js";
 
 export interface DrawCommand {
-  type: "fillRect" | "strokeRect" | "text" | "line" | "clear" | "sprite";
+  /**
+   * Canvas-pixel drawing types (used by icon renderer etc.):
+   *   clear, fillRect, strokeRect, text, line, sprite
+   *
+   * OS-unit drawing types (used by OS_Plot interception):
+   *   os_setup  — configure the window for coordinate translation:
+   *               x = scrollX (work-area X at window's left edge)
+   *               y = scrollY (work-area Y at window's TOP edge, RISC OS upward Y)
+   *               w = window width in OS units  (visX1 - visX0)
+   *               h = window height in OS units (visY1 - visY0)
+   *   os_line   — draw line from (x,y) to (w,h) in work-area OS units
+   *   os_rect   — draw filled rect; x,y = OS lower-left corner (work-area),
+   *               w,h = width/height in OS units
+   */
+  type: "fillRect" | "strokeRect" | "text" | "line" | "clear" | "sprite"
+      | "os_setup" | "os_line" | "os_rect";
   x: number; y: number;
   w?: number; h?: number;
   text?: string;
@@ -60,11 +75,6 @@ export interface NativeHost {
   /** Remove the iconbar entry */
   removeIconbarEntry(taskHandle: number): void;
 
-  /**
-   * Push raw RGBA pixel data captured from the VIDC frame buffer into a
-   * window's canvas.  Called at the end of each Wimp redraw loop.
-   */
-  updateWindowPixels(handle: number, pixels: Uint8ClampedArray, width: number, height: number): void;
 }
 
 export interface NativeMenuItem {
