@@ -49,6 +49,8 @@ export class SystemBus {
   ) {
     this.ram = new Uint8Array(ramBytes);
     this.rom = new Uint8Array(0); // loaded via loadROM()
+    // Release ROM alias automatically when the ROM writes the MEMC control reg.
+    this.memc.onRomAliasRelease = () => { this.romActive = false; };
   }
 
   loadROM(data: Uint8Array): void {

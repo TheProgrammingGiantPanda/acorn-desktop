@@ -27,10 +27,17 @@ export class ArchimedesMachine {
   private paused   = false;
   private tickHandle: ReturnType<typeof setTimeout> | null = null;
 
+  /** True when the real ROM has been booted (vs. bare-program HLE mode). */
+  romBooted = false;
+
   mhz = 0;
   private cycleSnapshot = 0;
   private lastMeasure   = 0;
   private _dataAbortCount = 0;
+
+  /** Accumulated emulated microseconds since last VBL — drives 50 Hz VBL IRQ. */
+  private vblAccumUs = 0;
+  private static readonly VBL_PERIOD_US = 20_000; // 50 Hz = 20 ms
 
   constructor(private readonly config: MachineConfig, private readonly logger = new Logger()) {
     this.memc = new MEMC();
@@ -110,6 +117,8 @@ export class ArchimedesMachine {
     this.cpu.reset();
     this.cycleSnapshot = 0;
     this.lastMeasure   = Date.now();
+    this.vblAccumUs    = 0;
+    this.romBooted     = false;
   }
 
   /**
@@ -135,28 +144,32 @@ export class ArchimedesMachine {
     // rather than returning ROM data. The ROM boot has already completed.
     this.bus.releaseROMAlias();
 
-    // Install minimal exception handlers at the physical RAM backing logical 0x00.
-    // The ROM relied on the ROM alias for exception handling; after releasing it,
-    // those vectors are zeros which cause infinite zero-RAM traversal on any fault.
-    // MOVS PC, R14 (0xE1B0F00E) = return from exception, skipping the faulted instr.
-    // B .         (0xEAFFFFFE) = infinite loop (halt) for vectors we never expect.
-    const vecPhys = this.memc.translateAddress(0);
-    if (vecPhys !== null) {
-      const MOVS_PC_R14 = 0xE1B0F00E;
-      const B_SELF      = 0xEAFFFFFE;
-      const writeVec = (logOff: number, instr: number) => {
-        this.bus.dmaWrite(vecPhys + logOff, new Uint8Array([
-          instr & 0xFF, (instr >>> 8) & 0xFF, (instr >>> 16) & 0xFF, (instr >>> 24) & 0xFF,
-        ]));
-      };
-      writeVec(0x00, B_SELF);       // Reset — should never fire
-      writeVec(0x04, B_SELF);       // Undefined instruction — halt
-      writeVec(0x08, MOVS_PC_R14); // SWI — return (our JS handler intercepts first)
-      writeVec(0x0C, MOVS_PC_R14); // Prefetch abort — skip
-      writeVec(0x10, MOVS_PC_R14); // Data abort — skip faulted instruction
-      writeVec(0x14, B_SELF);       // Reserved — halt
-      writeVec(0x18, MOVS_PC_R14); // IRQ — return
-      writeVec(0x1C, MOVS_PC_R14); // FIQ — return
+    // Install minimal exception handlers only in HLE mode (no ROM boot).
+    // When the real ROM has booted it programs its own vectors in RAM — we must
+    // not overwrite them or IRQ/SWI dispatch will break.
+    if (!this.romBooted) {
+      // The ROM relied on the ROM alias for exception handling; after releasing it,
+      // those vectors are zeros which cause infinite zero-RAM traversal on any fault.
+      // MOVS PC, R14 (0xE1B0F00E) = return from exception, skipping the faulted instr.
+      // B .         (0xEAFFFFFE) = infinite loop (halt) for vectors we never expect.
+      const vecPhys = this.memc.translateAddress(0);
+      if (vecPhys !== null) {
+        const MOVS_PC_R14 = 0xE1B0F00E;
+        const B_SELF      = 0xEAFFFFFE;
+        const writeVec = (logOff: number, instr: number) => {
+          this.bus.dmaWrite(vecPhys + logOff, new Uint8Array([
+            instr & 0xFF, (instr >>> 8) & 0xFF, (instr >>> 16) & 0xFF, (instr >>> 24) & 0xFF,
+          ]));
+        };
+        writeVec(0x00, B_SELF);       // Reset — should never fire
+        writeVec(0x04, B_SELF);       // Undefined instruction — halt
+        writeVec(0x08, MOVS_PC_R14); // SWI — return (our JS handler intercepts first)
+        writeVec(0x0C, MOVS_PC_R14); // Prefetch abort — skip
+        writeVec(0x10, MOVS_PC_R14); // Data abort — skip faulted instruction
+        writeVec(0x14, B_SELF);       // Reserved — halt
+        writeVec(0x18, MOVS_PC_R14); // IRQ — return
+        writeVec(0x1C, MOVS_PC_R14); // FIQ — return
+      }
     }
 
     this.bus.dmaWrite(writeDest, data);
@@ -189,6 +202,28 @@ export class ArchimedesMachine {
     this.running = true;
     this.paused  = false;
     this.reset();
+    this.scheduleTick();
+  }
+
+  /**
+   * Boot the machine by executing the loaded ROM from address 0.
+   *
+   * Unlike `start()` + `loadProgram()`, this does NOT install any HLE stubs at
+   * address 0 or release the ROM alias manually — the ROM itself releases the
+   * alias when it writes the MEMC control register.  SWI handlers registered
+   * via `registerSWI()` still intercept Wimp and OS SWIs before the ROM's own
+   * SWI vector is reached, so native-window Wimp rendering continues to work.
+   *
+   * A RISC OS ROM image must have been loaded with `loadROM()` before calling
+   * this method.
+   */
+  bootROM(): void {
+    this.running   = true;
+    this.paused    = false;
+    this.romBooted = true;
+    this.reset();
+    // reset() clears romBooted — re-assert it after reset.
+    this.romBooted = true;
     this.scheduleTick();
   }
 
@@ -230,7 +265,15 @@ export class ArchimedesMachine {
       this.running = false;
       return;
     }
-    this.ioc.tick(Math.floor((steps / clockHz) * 1_000_000));
+    const stepUs = Math.floor((steps / clockHz) * 1_000_000);
+    this.ioc.tick(stepUs);
+
+    // Fire vertical-blank interrupt at ~50 Hz so the ROM task switcher wakes.
+    this.vblAccumUs += stepUs;
+    if (this.vblAccumUs >= ArchimedesMachine.VBL_PERIOD_US) {
+      this.vblAccumUs -= ArchimedesMachine.VBL_PERIOD_US;
+      this.ioc.vblank();
+    }
 
     // MHz measurement
     const now = Date.now();
