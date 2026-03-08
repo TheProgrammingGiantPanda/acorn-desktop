@@ -140,21 +140,17 @@ function buildEntryEl(entry: DirEntry): HTMLElement {
     selectedEntry = el;
   });
 
-  // Double click — open dir or launch app
+  // Double click — launch app, navigate into plain dir, ignore plain files
   el.addEventListener("dblclick", async () => {
     const target = childPath(curPath, entry.name);
-    if (entry.isDir) {
-      if (entry.isApp) {
-        // Open a new hostfs-browser window for this app dir
-        await window.hostfsBrowser.openDir(target);
-      } else {
-        // Navigate within this window
-        navigateTo(target);
-      }
-    } else {
-      // File — try to launch it
+    if (entry.isApp) {
+      // RISC OS application directory — run it
       await window.hostfsBrowser.launch(target);
+    } else if (entry.isDir) {
+      // Plain directory — navigate into it
+      navigateTo(target);
     }
+    // Plain files: no action (no RISC OS file-type association yet)
   });
 
   return el;
