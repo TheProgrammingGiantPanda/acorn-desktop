@@ -5,6 +5,15 @@
  * updating the iconbar, etc.) and then passed through to the ROM so that ROM's
  * own Wimp state stays correct.  Only Wimp_Poll and the canvas-redraw pair
  * (Wimp_RedrawWindow / Wimp_GetRectangle) are handled entirely in JS.
+ *
+ * Task tracking
+ * ─────────────
+ * RISC OS uses cooperative multitasking: a task switch can only happen inside
+ * Wimp_Poll (ROM runs other tasks then returns to the caller).  We identify the
+ * currently-running task by reading MEMC's translation of logical 0x8000 — the
+ * physical base address of the application slot changes every time ROM remaps
+ * for a different task.  This gives us a stable, ROM-authoritative task ID
+ * without needing to intercept every task-management SWI ourselves.
  */
 
 import type { RegisterFile, SwiReturnHook } from "@theprogramminggiantpanda/arm-emulator";
@@ -12,14 +21,32 @@ import type { SystemBus }    from "@theprogramminggiantpanda/arm-emulator";
 import type { NativeHost, NativeMenuItem } from "./native-host.js";
 import {
   type WimpWindowDef, type WimpIcon, type WimpWindow,
-  WimpEvent, WF_HAS_TITLE, IF_INDIRECTED, IF_TEXT,
-  osUnitsToPx, pxToOsUnits,
+  WimpEvent, IF_INDIRECTED, IF_TEXT,
+  osUnitsToPx,
 } from "./types.js";
 import type { ArchimedesMachine } from "@theprogramminggiantpanda/arm-emulator";
 import type { SpritePool, SpriteData } from "../sprite/sprite-pool.js";
 
 /** Return type for WimpManager handler methods — mirrors SwiHandler return type */
 type WR = void | 'passthrough' | { passthrough: true; afterReturn: SwiReturnHook };
+
+// ---------------------------------------------------------------------------
+// Per-task state
+// ---------------------------------------------------------------------------
+
+interface WimpTask {
+  /** ROM-assigned task handle (from Wimp_Initialise R1 on exit) */
+  handle:   number;
+  name:     string;
+  /** Physical address that logical 0x8000 translated to when the task initialised */
+  physBase: number;
+  /** Set of window handles created by this task (for cleanup on CloseDown) */
+  windows:  Set<number>;
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
 /** Read a null-terminated string from ARM RAM */
 function readString(bus: SystemBus, addr: number, maxLen = 256): string {
@@ -32,24 +59,14 @@ function readString(bus: SystemBus, addr: number, maxLen = 256): string {
   return str;
 }
 
-/** Write a null-terminated string into ARM RAM */
-function writeString(bus: SystemBus, addr: number, str: string): void {
-  for (let i = 0; i < str.length; i++) {
-    bus.write8(addr + i, str.charCodeAt(i));
-  }
-  bus.write8(addr + str.length, 0);
-}
-
-/** Read a 64-byte Wimp window definition block from RAM (R1) */
+/** Read a Wimp window definition block from RAM (R1) */
 function readWindowDef(bus: SystemBus, addr: number): WimpWindowDef {
   const r = (off: number) => bus.read32(addr + off) | 0;
   const titleFlags = r(72);
   let title = "";
   if (titleFlags & IF_INDIRECTED) {
-    const ptr = r(76);
-    title = readString(bus, ptr);
+    title = readString(bus, r(76));
   } else if (titleFlags & IF_TEXT) {
-    // Inline — 12 bytes at offset 76
     title = readString(bus, addr + 76, 12);
   }
 
@@ -80,7 +97,7 @@ function readWindowDef(bus: SystemBus, addr: number): WimpWindowDef {
 function readMenu(bus: SystemBus, addr: number): { title: string; items: NativeMenuItem[] } {
   const title = readString(bus, addr, 12);
   const items: NativeMenuItem[] = [];
-  let ptr = addr + 28; // menu items start after header
+  let ptr = addr + 28;
   for (;;) {
     const flags    = bus.read32(ptr);
     const submenu  = bus.read32(ptr + 4);
@@ -96,18 +113,27 @@ function readMenu(bus: SystemBus, addr: number): { title: string; items: NativeM
       item.submenu = readMenu(bus, submenu).items;
     }
     items.push(item);
-    if (flags & (1 << 7)) break; // last item
+    if (flags & (1 << 7)) break;
     ptr += 24;
   }
   return { title, items };
 }
 
+// ---------------------------------------------------------------------------
+// WimpManager
+// ---------------------------------------------------------------------------
+
 export class WimpManager {
-  private windows  = new Map<number, WimpWindow>();
-  readonly events  = new (class { push(_: unknown) {} })(); // no-op — events come via ROM poll
-  private taskName = "Unknown";
-  private taskHandle = 0;
+  /** All registered tasks, keyed by ROM task handle */
+  private tasks = new Map<number, WimpTask>();
+  /** Same tasks, keyed by the physical address of logical 0x8000 at init time */
+  private tasksByPhysBase = new Map<number, WimpTask>();
+
+  /** All windows across all tasks, keyed by window handle */
+  private windows = new Map<number, WimpWindow>();
+
   private machine!: ArchimedesMachine;
+  private spritePool: SpritePool | null = null;
 
   // ── OS_Plot / VDU drawing state ────────────────────────────────────────────
   private currentRedrawHandle: number | null = null;
@@ -115,7 +141,6 @@ export class WimpManager {
   private graphicsY = 0;
   private fgColour = "#000000";
   private pendingCmds: import("./native-host.js").DrawCommand[] = [];
-  private spritePool: SpritePool | null = null;
 
   constructor(private readonly host: NativeHost) {}
 
@@ -123,36 +148,61 @@ export class WimpManager {
   setSpritePool(pool: SpritePool): void  { this.spritePool = pool; }
 
   // ---------------------------------------------------------------------------
+  // Task resolution
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Returns the WimpTask whose application slot (logical 0x8000) is currently
+   * mapped by MEMC — i.e. whichever task the ARM CPU is running right now.
+   *
+   * Returns null if the task has not yet called Wimp_Initialise (e.g. during
+   * the ROM boot sequence before any task registers).
+   */
+  private currentTask(): WimpTask | null {
+    const phys = this.machine.memc.translateAddress(0x8000);
+    if (phys === null) return null;
+    return this.tasksByPhysBase.get(phys) ?? null;
+  }
+
+  // ---------------------------------------------------------------------------
   // SWI implementations
   // ---------------------------------------------------------------------------
 
   /**
-   * Wimp_Initialise — read task name, then passthrough so ROM registers the task.
-   * afterReturn captures ROM's real task handle from R1.
+   * Wimp_Initialise — read task name, passthrough to ROM, then afterReturn:
+   *   - records ROM's task handle (R1)
+   *   - snapshots MEMC's physical base for 0x8000 as this task's identity key
    */
   initialise(regs: RegisterFile, bus: SystemBus): WR {
-    this.taskName = readString(bus, regs.read(2));
+    const name = readString(bus, regs.read(2));
     return {
       passthrough: true,
-      afterReturn: (r) => {
-        this.taskHandle = r.read(1);
-        console.log(`[Wimp_Initialise] task="${this.taskName}" handle=${this.taskHandle} (ROM-assigned)`);
+      afterReturn: (_r) => {
+        const handle   = _r.read(1);
+        const physBase = this.machine.memc.translateAddress(0x8000) ?? 0;
+        const task: WimpTask = { handle, name, physBase, windows: new Set() };
+        this.tasks.set(handle, task);
+        this.tasksByPhysBase.set(physBase, task);
+        console.log(`[Wimp_Initialise] task="${name}" handle=${handle} physBase=0x${physBase.toString(16)}`);
       },
     };
   }
 
   /**
    * Wimp_CreateWindow — passthrough to ROM first; afterReturn creates the native
-   * BrowserWindow using the handle ROM assigned (written to R1 on exit).
+   * BrowserWindow using the handle ROM assigned (R1 on exit) and registers it
+   * under the current task.
    */
   createWindow(regs: RegisterFile, bus: SystemBus): WR {
-    const def = readWindowDef(bus, regs.read(1));
+    const def  = readWindowDef(bus, regs.read(1));
+    const task = this.currentTask();
     return {
       passthrough: true,
       afterReturn: (r) => {
-        const handle = r.read(1); // ROM's assigned window handle
+        const handle = r.read(1);
         this.host.createWindow(handle, def);
         this.windows.set(handle, { handle, def, icons: new Map(), open: false, dirty: true });
+        task?.windows.add(handle);
       },
     };
   }
@@ -187,11 +237,13 @@ export class WimpManager {
     return 'passthrough';
   }
 
-  /** Wimp_DeleteWindow — destroy native window, let ROM clean up its state */
+  /** Wimp_DeleteWindow — destroy native window, let ROM clean up */
   deleteWindow(regs: RegisterFile, bus: SystemBus): WR {
     const handle = bus.read32(regs.read(1)) | 0;
     this.host.destroyWindow(handle);
     this.windows.delete(handle);
+    // Remove from whichever task owns it
+    for (const task of this.tasks.values()) task.windows.delete(handle);
     return 'passthrough';
   }
 
@@ -199,8 +251,14 @@ export class WimpManager {
    * Wimp_Poll / Wimp_PollIdle
    *
    * 1. Sync-check our native event queue (mouse, window, keyboard events).
-   * 2. If empty, passthrough to ROM — ROM may have messages/events queued.
-   * 3. If ROM also returns Null, suspend CPU and wait for next native event.
+   * 2. If empty, passthrough to ROM — ROM may have messages/events queued for
+   *    this or other tasks, or it may run other tasks and return null.
+   * 3. If ROM also returns Null, suspend the CPU and wait for the next native event.
+   *
+   * Task identity: the task calling poll is whatever MEMC has mapped at 0x8000
+   * right now.  After ROM's poll returns (step 2), MEMC may have switched to a
+   * different task.  If we reach step 3, MEMC is unchanged (we suspended before
+   * any switch) so the waking event correctly belongs to the current task.
    */
   poll(regs: RegisterFile, bus: SystemBus, _pollIdle: boolean): WR {
     const mask      = regs.read(0);
@@ -213,20 +271,19 @@ export class WimpManager {
         bus.write32(blockAddr + i * 4, pending.data[i]!);
       }
       regs.write(0, pending.code);
-      return; // no passthrough, no suspend
+      return;
     }
 
-    // Let ROM check its own queue (messages sent by modules/apps via Wimp_SendMessage)
+    // Let ROM check its own queue (Wimp_SendMessage deliveries, etc.)
     return {
       passthrough: true,
       afterReturn: (r, b) => {
         const romCode = r.read(0);
         if (romCode !== WimpEvent.Null && !((mask >> romCode) & 1)) {
-          // ROM delivered a real unmasked event — already written to the block by ROM.
-          // CPU resumes normally.
+          // ROM delivered a real unmasked event — already written to the block.
           return;
         }
-        // ROM also returned Null. Suspend and wait for a native event.
+        // ROM returned Null. Suspend and wait for a native event.
         this.machine.cpu.swiPending = true;
         void this.host.pollEvent(mask).then((ev) => {
           for (let i = 0; i < ev.data.length; i++) {
@@ -244,12 +301,8 @@ export class WimpManager {
     const blockAddr = regs.read(1);
     const handle    = bus.read32(blockAddr) | 0;
     const win       = this.windows.get(handle);
-    if (!win) {
-      regs.write(0, 0);
-      return;
-    }
+    if (!win) { regs.write(0, 0); return; }
 
-    // Write window state for the app to read
     const d = win.def;
     bus.write32(blockAddr + 0,  d.visX0);
     bus.write32(blockAddr + 4,  d.visY0);
@@ -259,28 +312,22 @@ export class WimpManager {
     bus.write32(blockAddr + 20, d.scrollY);
     bus.write32(blockAddr + 24, win.open ? -1 : 0);
     bus.write32(blockAddr + 28, d.flags | (win.open ? 0x10000 : 0));
-    regs.write(0, 1); // non-zero = rectangle to redraw
+    regs.write(0, 1);
 
     this.currentRedrawHandle = handle;
     this.pendingCmds = [
-      {
-        type: "os_setup",
-        x: win.def.scrollX,
-        y: win.def.scrollY,
-        w: win.def.visX1 - win.def.visX0,
-        h: win.def.visY1 - win.def.visY0,
-      },
+      { type: "os_setup", x: d.scrollX, y: d.scrollY,
+        w: d.visX1 - d.visX0, h: d.visY1 - d.visY0 },
       { type: "clear", x: 0, y: 0 },
     ];
   }
 
   /**
-   * Wimp_GetRectangle — ends the canvas redraw loop (pure HLE, no passthrough).
-   * Flushes all batched OS_Plot commands to the native window canvas.
+   * Wimp_GetRectangle — ends the canvas redraw loop; flushes draw commands
+   * to the native window canvas (pure HLE, no passthrough).
    */
   getWindowRect(regs: RegisterFile, _bus: SystemBus): void {
-    regs.write(0, 0); // no more rectangles
-
+    regs.write(0, 0);
     if (this.currentRedrawHandle !== null && this.pendingCmds.length > 0) {
       this.host.draw(this.currentRedrawHandle, this.pendingCmds);
     }
@@ -296,33 +343,24 @@ export class WimpManager {
     const absolute   = !!(code & 4);
     const drawAction = code & 3;
     const opType     = (code >>> 3) & 0x1F;
-
     const absX = absolute ? x : this.graphicsX + x;
     const absY = absolute ? y : this.graphicsY + y;
 
     if (drawAction !== 0) {
       switch (opType) {
         case 0:
-          this.pendingCmds.push({
-            type: "os_line",
-            x: this.graphicsX, y: this.graphicsY,
-            w: absX, h: absY,
-            colour: this.fgColour,
-          });
+          this.pendingCmds.push({ type: "os_line",
+            x: this.graphicsX, y: this.graphicsY, w: absX, h: absY,
+            colour: this.fgColour });
           break;
         case 12:
-          this.pendingCmds.push({
-            type: "os_rect",
-            x: Math.min(this.graphicsX, absX),
-            y: Math.min(this.graphicsY, absY),
-            w: Math.abs(absX - this.graphicsX),
-            h: Math.abs(absY - this.graphicsY),
-            colour: this.fgColour,
-          });
+          this.pendingCmds.push({ type: "os_rect",
+            x: Math.min(this.graphicsX, absX), y: Math.min(this.graphicsY, absY),
+            w: Math.abs(absX - this.graphicsX), h: Math.abs(absY - this.graphicsY),
+            colour: this.fgColour });
           break;
       }
     }
-
     this.graphicsX = absX;
     this.graphicsY = absY;
   }
@@ -333,12 +371,11 @@ export class WimpManager {
   /** Wimp_CreateMenu (pure HLE — native menu, no passthrough) */
   async createMenu(regs: RegisterFile, bus: SystemBus): Promise<void> {
     const menuAddr = regs.read(1);
-    const x = regs.read(2);
-    const y = regs.read(3);
-    if (menuAddr === -1) return; // close menu
+    if (menuAddr === -1) return;
 
     const { title, items } = readMenu(bus, menuAddr);
-    const selection = await this.host.showMenu(title, items, osUnitsToPx(x), osUnitsToPx(y));
+    const selection = await this.host.showMenu(
+      title, items, osUnitsToPx(regs.read(2)), osUnitsToPx(regs.read(3)));
 
     if (selection) {
       const blockAddr = regs.read(1);
@@ -346,67 +383,68 @@ export class WimpManager {
         bus.write32(blockAddr + i * 4, selection[i]!);
       }
       bus.write32(blockAddr + selection.length * 4, -1);
-      // Menu selection delivered via native event route — push to host
-      this.host.tryPollEvent; // (host delivers via deliverEvent internally)
     }
   }
 
   /** Wimp_ReportError (pure HLE — native dialog, no passthrough) */
   async reportError(regs: RegisterFile, bus: SystemBus): Promise<void> {
-    const errBlock = regs.read(0);
-    const flags    = regs.read(1);
-    const nameAddr = regs.read(2);
-    const message  = readString(bus, errBlock + 4);
-    const name     = readString(bus, nameAddr);
+    const message = readString(bus, regs.read(0) + 4);
+    const name    = readString(bus, regs.read(2));
 
     this.machine.cpu.swiPending = true;
-    const button = await this.host.showError(message, flags, name);
+    const button = await this.host.showError(message, regs.read(1), name);
     regs.write(1, button);
     this.machine.wakeFromSWI();
   }
 
   /**
-   * Wimp_CreateIcon — for iconbar icons (winHandle = -2), add to native iconbar.
-   * Always passthrough so ROM also tracks the icon.
+   * Wimp_CreateIcon — for iconbar icons (winHandle = -2), add to native iconbar
+   * under the current task's handle.  Always passthrough so ROM tracks the icon.
    */
   createIcon(regs: RegisterFile, bus: SystemBus): WR {
-    const blockAddr  = regs.read(1);
-    const winHandle  = bus.read32(blockAddr) | 0;
-    const flags = bus.read32(blockAddr + 20);
+    const blockAddr = regs.read(1);
+    const winHandle = bus.read32(blockAddr) | 0;
+    const flags     = bus.read32(blockAddr + 20);
 
     if (winHandle === -2) {
-      // Iconbar icon: extract sprite name from validation string ("Sspritename") or text
       let sprite = "application";
       let text   = "";
       if (flags & IF_INDIRECTED) {
         text       = readString(bus, bus.read32(blockAddr + 24));
         const vstr = readString(bus, bus.read32(blockAddr + 28));
-        if (vstr && (vstr[0] === 'S' || vstr[0] === 's')) {
-          sprite = vstr.slice(1);
-        } else if (text) {
-          sprite = text;
-        }
+        if (vstr && (vstr[0] === 'S' || vstr[0] === 's')) sprite = vstr.slice(1);
+        else if (text) sprite = text;
       } else {
         text   = readString(bus, blockAddr + 24, 12);
         sprite = text || sprite;
       }
 
+      const task       = this.currentTask();
+      const taskHandle = task?.handle ?? 0;
       const spriteData: SpriteData | undefined = this.spritePool?.get(sprite);
-      console.log(`[Wimp_CreateIcon(-2)] sprite="${sprite}" spriteDataFound=${!!spriteData}`);
-      this.host.setIconbarEntry(this.taskHandle, sprite, text || sprite, spriteData);
+      console.log(`[Wimp_CreateIcon(-2)] task=${taskHandle} sprite="${sprite}" spriteDataFound=${!!spriteData}`);
+      this.host.setIconbarEntry(taskHandle, sprite, text || sprite, spriteData);
     }
 
-    // Always passthrough — ROM tracks the icon and assigns the handle
     return 'passthrough';
   }
 
-  /** Wimp_CloseDown — clean up native resources, then let ROM deregister the task */
+  /**
+   * Wimp_CloseDown — destroy only this task's windows and remove its iconbar
+   * entry, then passthrough so ROM deregisters the task.
+   */
   closeDown(_regs: RegisterFile, _bus: SystemBus): WR {
-    this.host.removeIconbarEntry(this.taskHandle);
-    for (const [handle] of this.windows) {
-      this.host.destroyWindow(handle);
+    const task = this.currentTask();
+    if (task) {
+      this.host.removeIconbarEntry(task.handle);
+      for (const handle of task.windows) {
+        this.host.destroyWindow(handle);
+        this.windows.delete(handle);
+      }
+      this.tasks.delete(task.handle);
+      this.tasksByPhysBase.delete(task.physBase);
+      console.log(`[Wimp_CloseDown] task="${task.name}" handle=${task.handle}`);
     }
-    this.windows.clear();
     return 'passthrough';
   }
 
