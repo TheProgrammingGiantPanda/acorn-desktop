@@ -28,6 +28,7 @@ updateClock();
 setInterval(updateClock, 10_000);
 
 window.iconbar.onUpdate((entries) => {
+  console.log(`[iconbar] onUpdate: ${entries.length} entries`, entries.map(([h, e]) => `${h}:${e.sprite}`));
   iconsEl.innerHTML = "";
   for (const [taskHandle, { sprite, text, spriteData }] of entries) {
     const entry = document.createElement("div");

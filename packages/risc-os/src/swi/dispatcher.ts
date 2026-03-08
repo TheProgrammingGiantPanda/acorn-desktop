@@ -34,11 +34,6 @@ export interface DispatcherOptions {
   fs?: FileSystemHost;
   /** Called when an Obey Run command targets an ARM binary */
   onRunBinary?: (riscosPath: string) => void;
-  /**
-   * Called when Service_StartFiler (&4D) is broadcast — the Filer has started
-   * and modules should add their disc icons to the iconbar.
-   */
-  onServiceStartFiler?: () => void;
 }
 
 export class SwiDispatcher {
@@ -87,15 +82,9 @@ export class SwiDispatcher {
     cpu.swiHandlers.set(SWI.OS_Heap,         os.OS_Heap);
     cpu.swiHandlers.set(SWI.OS_WriteN,       os.OS_WriteN);
 
-    // OS_ServiceCall (SWI &30): intercept Service_StartFiler then pass to ROM
-    cpu.swiHandlers.set(SWI.OS_ServiceCall, (regs) => {
-      const service = regs.read(1) >>> 0;
-      // Service_StartFiler = 0x4D: Filer is starting, modules should add disc icons
-      if (service === 0x4D) {
-        options.onServiceStartFiler?.();
-      }
-      return 'passthrough'; // Always let ROM dispatch to modules too
-    });
+    // OS_ServiceCall: passthrough to ROM so modules receive all service broadcasts.
+    // Individual modules (e.g. the HostFS ARM module) handle Service_StartFiler
+    // in their own service entries and call Wimp_CreateIcon(-2) directly.
 
     // ── System variables ──────────────────────────────────────────────────────
     const { sysvar, obey } = this;
@@ -153,44 +142,35 @@ export class SwiDispatcher {
     // ── Wimp ─────────────────────────────────────────────────────────────────
     const w = this.wimp;
 
-    cpu.swiHandlers.set(SWI.Wimp_Initialise, (r, b) => w.initialise(r, b));
+    // Window lifecycle: intercept for native side-effects, passthrough to ROM.
+    // ROM assigns real handles (returned in R1) and maintains its own Wimp state.
+    cpu.swiHandlers.set(SWI.Wimp_Initialise,   (r, b) => w.initialise(r, b));
+    cpu.swiHandlers.set(SWI.Wimp_CreateWindow, (r, b) => w.createWindow(r, b));
+    cpu.swiHandlers.set(SWI.Wimp_OpenWindow,   (r, b) => w.openWindow(r, b));
+    cpu.swiHandlers.set(SWI.Wimp_CloseWindow,  (r, b) => w.closeWindow(r, b));
+    cpu.swiHandlers.set(SWI.Wimp_DeleteWindow, (r, b) => w.deleteWindow(r, b));
+    cpu.swiHandlers.set(SWI.Wimp_CreateIcon,   (r, b) => w.createIcon(r, b));
+    cpu.swiHandlers.set(SWI.Wimp_CloseDown,    (r, b) => w.closeDown(r, b));
 
-    // Async Wimp calls: fire-and-forget, suspending the CPU until wakeFromSWI()
-    cpu.swiHandlers.set(SWI.Wimp_CreateWindow,
-      (r, b) => { m.cpu.swiPending = true; void w.createWindow(r, b).then(() => m.wakeFromSWI()); });
+    // Poll: hybrid — native events take priority, then ROM events, then suspend.
+    cpu.swiHandlers.set(SWI.Wimp_Poll,     (r, b) => w.poll(r, b, false));
+    cpu.swiHandlers.set(SWI.Wimp_PollIdle, (r, b) => w.poll(r, b, true));
 
-    cpu.swiHandlers.set(SWI.Wimp_OpenWindow,
-      (r, b) => { m.cpu.swiPending = true; void w.openWindow(r, b).then(() => m.wakeFromSWI()); });
+    // Canvas redraw loop: pure HLE (ROM framebuffer is separate from our canvas).
+    cpu.swiHandlers.set(SWI.Wimp_RedrawWindow, (r, b) => w.redrawWindow(r, b));
+    cpu.swiHandlers.set(SWI.Wimp_UpdateWindow, (r, b) => w.redrawWindow(r, b));
+    cpu.swiHandlers.set(SWI.Wimp_GetRectangle, (r, b) => w.getWindowRect(r, b));
 
-    cpu.swiHandlers.set(SWI.Wimp_CloseWindow,
-      (r, b) => { m.cpu.swiPending = true; void w.closeWindow(r, b).then(() => m.wakeFromSWI()); });
-
-    cpu.swiHandlers.set(SWI.Wimp_DeleteWindow,
-      (r, b) => { m.cpu.swiPending = true; void w.deleteWindow(r, b).then(() => m.wakeFromSWI()); });
-
-    cpu.swiHandlers.set(SWI.Wimp_Poll,
-      (r, b) => { void w.poll(r, b, false); });
-
-    cpu.swiHandlers.set(SWI.Wimp_PollIdle,
-      (r, b) => { void w.poll(r, b, true); });
-
-    cpu.swiHandlers.set(SWI.Wimp_RedrawWindow,    (r, b) => w.redrawWindow(r, b));
-    cpu.swiHandlers.set(SWI.Wimp_UpdateWindow,    (r, b) => w.redrawWindow(r, b));
-    cpu.swiHandlers.set(SWI.Wimp_GetRectangle,    (r, b) => w.getWindowRect(r, b));
-    cpu.swiHandlers.set(SWI.Wimp_GetWindowState,  (r, b) => w.getWindowState(r, b));
-    cpu.swiHandlers.set(SWI.Wimp_ForceRedraw,     (r, b) => w.forceRedraw(r, b));
-    cpu.swiHandlers.set(SWI.Wimp_CreateIcon,      (r, b) => w.createIcon(r, b));
-    cpu.swiHandlers.set(SWI.Wimp_GetPointerInfo,  (r, b) => w.getPointerInfo(r, b));
-    cpu.swiHandlers.set(SWI.Wimp_SlotSize,        (r, b) => w.slotSize(r, b));
-    cpu.swiHandlers.set(SWI.Wimp_ReadSysInfo,     (r, b) => w.readSysInfo(r, b));
-    cpu.swiHandlers.set(SWI.Wimp_CloseDown,       (r, b) => w.closeDown(r, b));
-    cpu.swiHandlers.set(SWI.Wimp_SendMessage,     (r, b) => w.sendMessage(r, b));
-
+    // Native UI: menus and error dialogs handled in JS, no passthrough.
     cpu.swiHandlers.set(SWI.Wimp_CreateMenu,
       (r, b) => { m.cpu.swiPending = true; void w.createMenu(r, b).then(() => m.wakeFromSWI()); });
-
     cpu.swiHandlers.set(SWI.Wimp_ReportError,
       (r, b) => { void w.reportError(r, b); });
+
+    // All other Wimp_* SWIs (GetWindowState, ForceRedraw, SlotSize, ReadSysInfo,
+    // GetPointerInfo, SendMessage, GetWindowInfo, SetIconState, SetExtent, etc.)
+    // passthrough to ROM — ROM has correct state because we passthrough all
+    // window/task lifecycle SWIs above.
 
     // ── Sprite operations ─────────────────────────────────────────────────────
     const spriteHandler = new OSSpriteHandler(this.spriteAreas, fs);

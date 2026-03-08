@@ -9,7 +9,7 @@ import { app, BrowserWindow, ipcMain, Menu, dialog } from "electron";
 import path from "path";
 import fs from "fs";
 import { ArchimedesMachine } from "@theprogramminggiantpanda/arm-emulator";
-import { SwiDispatcher, ObeyInterpreter, SpritePool } from "@theprogramminggiantpanda/risc-os";
+import { SwiDispatcher, ObeyInterpreter, SpritePool, WimpEvent } from "@theprogramminggiantpanda/risc-os";
 import { NativeWimpHost } from "./native-wimp-host.js";
 import { NodeFsHost } from "./node-fs-host.js";
 import { HostFsHandler } from "./hostfs-handler.js";
@@ -20,9 +20,6 @@ import { IPC, Logger } from "@theprogramminggiantpanda/shared";
 
 const isDev = !app.isPackaged;
 const logger = new Logger(isDev ? 'debug' : 'error');
-
-// Special iconbar handle for the HostFS disc icon (-999 won't collide with task handles)
-const HOSTFS_ICONBAR_HANDLE = -999;
 
 // ---------------------------------------------------------------------------
 // Asset path resolution
@@ -250,10 +247,6 @@ function startMachine(romData: Uint8Array, appHostPath?: string): void {
       launcherWindow?.webContents.send("console-output", text);
     },
     obeyFs: nodeFs,
-    onServiceStartFiler: () => {
-      logger.debug(`[HostFS] Service_StartFiler received — adding iconbar disc icon`);
-      wimpHost?.setIconbarEntry(HOSTFS_ICONBAR_HANDLE, "hostfsdisk", "HostFS::$");
-    },
   });
 
   // Register HostFS: intercepts OS_File/OS_Find/OS_GBPB/OS_Args for "HostFS::"
@@ -274,10 +267,34 @@ function startMachine(romData: Uint8Array, appHostPath?: string): void {
   // Register private SWIs that the module stubs delegate to
   hostfs.registerPrivateSWIs(machine);
 
-  // Register SWI 0x041509 — service entry callback (add iconbar icon)
-  machine.cpu.swiHandlers.set(0x041509, () => {
-    logger.debug(`[HostFS] ARM module service callback — adding iconbar disc icon`);
-    wimpHost?.setIconbarEntry(HOSTFS_ICONBAR_HANDLE, "hostfsdisk", "HostFS::$");
+  // SWI 0x041509 — HostFS ARM module service entry for Service_StartFiler.
+  // Synthesise a Wimp_CreateIcon(-2) call so the disc icon goes through the
+  // normal RISC OS path (sprite lookup, native iconbar update, etc.).
+  machine.cpu.swiHandlers.set(0x041509, (regs, bus) => {
+    if (!dispatcher) return;
+    // Build a Wimp_CreateIcon block in a scratch area below the HostFS module.
+    // Format: handle(-2), x0,y0,x1,y1 (OS units), flags, 12-byte sprite name.
+    const SCRATCH = 0x7F000;
+    const writeW  = (off: number, v: number) => {
+      bus.write8(SCRATCH + off,     v         & 0xFF);
+      bus.write8(SCRATCH + off + 1, (v >>> 8)  & 0xFF);
+      bus.write8(SCRATCH + off + 2, (v >>> 16) & 0xFF);
+      bus.write8(SCRATCH + off + 3, (v >>> 24) & 0xFF);
+    };
+    writeW( 0, -2 >>> 0);   // window handle = iconbar (right of centre)
+    writeW( 4, 0);           // x0
+    writeW( 8, 0);           // y0
+    writeW(12, 68);          // x1 — standard 34×34 px icon = 68 OS units wide
+    writeW(16, 68);          // y1
+    // flags: IF_SPRITE(2) | IF_HCENTRED(8) | IF_VCENTRED(16) = 0x1A
+    writeW(20, 0x1A);
+    // Inline sprite name "disc\0" padded to 12 bytes
+    const name = "disc";
+    for (let i = 0; i < 12; i++) bus.write8(SCRATCH + 24 + i, i < name.length ? name.charCodeAt(i) : 0);
+
+    regs.write(1, SCRATCH);
+    dispatcher.wimp.createIcon(regs, bus);
+    logger.debug(`[HostFS] Wimp_CreateIcon(-2) disc icon added to iconbar`);
   });
 
   // One-shot hook on first Wimp_Poll to run the module init ARM routine.
@@ -298,7 +315,9 @@ function startMachine(romData: Uint8Array, appHostPath?: string): void {
           } else {
             machine!.cpu.swiHandlers.delete(0x400C7);
           }
-          void dispatcher!.wimp.poll(r, b, false);
+          // Deliver a null event so the ARM code re-polls via the restored handler
+          r.write(0, WimpEvent.Null);
+          machine!.wakeFromSWI();
         })
         .catch(err => {
           logger.error(`[HostFS] Module init failed: ${err}`);
@@ -307,21 +326,13 @@ function startMachine(romData: Uint8Array, appHostPath?: string): void {
           } else {
             machine!.cpu.swiHandlers.delete(0x400C7);
           }
-          void dispatcher!.wimp.poll(r, b, false);
+          r.write(0, WimpEvent.Null);
+          machine!.wakeFromSWI();
         });
       return; // CPU suspended — don't call poll yet
     }
-    origPollHandler?.(r, b);
+    return origPollHandler?.(r, b);
   });
-
-  // Fallback: add iconbar icon after a delay in case Service_StartFiler
-  // is not broadcast (e.g. ROM doesn't have Filer)
-  setTimeout(() => {
-    if (wimpHost && !wimpHost["iconbarEntries"]?.has(HOSTFS_ICONBAR_HANDLE)) {
-      logger.debug(`[HostFS] Fallback — adding iconbar disc icon`);
-      wimpHost.setIconbarEntry(HOSTFS_ICONBAR_HANDLE, "hostfsdisk", "HostFS::$");
-    }
-  }, 3000);
 
   bootAllApps();
 
@@ -334,8 +345,8 @@ function startMachine(romData: Uint8Array, appHostPath?: string): void {
       machine?.execCLI(`Run HostFS::$.${appName}.!Run`);
     }, 3500);
   }
-  // No specific app — just boot the ROM and wait for the Filer to start.
-  // The Service_StartFiler callback (or the fallback timer) will add the icon.
+  // No specific app — just boot the ROM; the Filer will add disc icons via
+  // normal RISC OS mechanisms (Service_StartFiler → Wimp_CreateIcon(-2)).
 
   // Hide the launcher now that the ROM is running — the Filer provides the UI.
   // (We keep it hidden rather than closed so the app process stays alive while
@@ -436,17 +447,6 @@ ipcMain.handle(IPC.HOSTFS_OPEN_DIR, (_ev, riscosPath: string) => {
   createHostFsBrowserWindow(riscosPath);
 });
 
-// ---------------------------------------------------------------------------
-// Iconbar click → open HostFS browser
-// ---------------------------------------------------------------------------
-// Listen for iconbar-click in main process to intercept HOSTFS_ICONBAR_HANDLE.
-// NativeWimpHost also listens for this event, so it will forward other handles
-// to RISC OS tasks normally.
-ipcMain.on("iconbar-click", (_ev, { taskHandle }: { taskHandle: number; buttons: number }) => {
-  if (taskHandle === HOSTFS_ICONBAR_HANDLE) {
-    createHostFsBrowserWindow("HostFS::$");
-  }
-});
 
 // ---------------------------------------------------------------------------
 // Auto-load ROM from assets/roms/ on startup

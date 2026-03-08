@@ -1,14 +1,15 @@
 /**
- * WimpManager — implements all Wimp_* SWIs.
+ * WimpManager — implements Wimp_* SWIs.
  *
- * Reads/writes data from ARM RAM via the SystemBus, calls NativeHost to
- * manage real OS windows, and feeds events back via Wimp_Poll.
+ * Most SWIs are intercepted for native side-effects (creating BrowserWindows,
+ * updating the iconbar, etc.) and then passed through to the ROM so that ROM's
+ * own Wimp state stays correct.  Only Wimp_Poll and the canvas-redraw pair
+ * (Wimp_RedrawWindow / Wimp_GetRectangle) are handled entirely in JS.
  */
 
-import type { RegisterFile } from "@theprogramminggiantpanda/arm-emulator";
+import type { RegisterFile, SwiReturnHook } from "@theprogramminggiantpanda/arm-emulator";
 import type { SystemBus }    from "@theprogramminggiantpanda/arm-emulator";
 import type { NativeHost, NativeMenuItem } from "./native-host.js";
-import { WimpEventQueue }   from "./event-queue.js";
 import {
   type WimpWindowDef, type WimpIcon, type WimpWindow,
   WimpEvent, WF_HAS_TITLE, IF_INDIRECTED, IF_TEXT,
@@ -16,6 +17,9 @@ import {
 } from "./types.js";
 import type { ArchimedesMachine } from "@theprogramminggiantpanda/arm-emulator";
 import type { SpritePool, SpriteData } from "../sprite/sprite-pool.js";
+
+/** Return type for WimpManager handler methods — mirrors SwiHandler return type */
+type WR = void | 'passthrough' | { passthrough: true; afterReturn: SwiReturnHook };
 
 /** Read a null-terminated string from ARM RAM */
 function readString(bus: SystemBus, addr: number, maxLen = 256): string {
@@ -72,19 +76,6 @@ function readWindowDef(bus: SystemBus, addr: number): WimpWindowDef {
   };
 }
 
-/** Write a window state block back to RAM (for Wimp_GetWindowState) */
-function writeWindowState(bus: SystemBus, addr: number, win: WimpWindow): void {
-  const d = win.def;
-  bus.write32(addr + 0,  d.visX0);
-  bus.write32(addr + 4,  d.visY0);
-  bus.write32(addr + 8,  d.visX1);
-  bus.write32(addr + 12, d.visY1);
-  bus.write32(addr + 16, d.scrollX);
-  bus.write32(addr + 20, d.scrollY);
-  bus.write32(addr + 24, win.open ? -1 : 0); // behind
-  bus.write32(addr + 28, d.flags | (win.open ? 0x10000 : 0));
-}
-
 /** Read a Wimp menu structure from RAM */
 function readMenu(bus: SystemBus, addr: number): { title: string; items: NativeMenuItem[] } {
   const title = readString(bus, addr, 12);
@@ -113,23 +104,17 @@ function readMenu(bus: SystemBus, addr: number): { title: string; items: NativeM
 
 export class WimpManager {
   private windows  = new Map<number, WimpWindow>();
-  private nextHandle = 1;
-  readonly events  = new WimpEventQueue();
+  readonly events  = new (class { push(_: unknown) {} })(); // no-op — events come via ROM poll
   private taskName = "Unknown";
   private taskHandle = 0;
   private machine!: ArchimedesMachine;
 
   // ── OS_Plot / VDU drawing state ────────────────────────────────────────────
-  /** Handle of the window currently being redrawn, or null when not in a redraw loop */
   private currentRedrawHandle: number | null = null;
-  /** Current graphics cursor in OS units (absolute screen coordinates) */
   private graphicsX = 0;
   private graphicsY = 0;
-  /** Current foreground draw colour as a CSS string */
   private fgColour = "#000000";
-  /** Batch of draw commands accumulated during one redraw cycle */
   private pendingCmds: import("./native-host.js").DrawCommand[] = [];
-  /** Sprite pool for looking up iconbar sprite pixel data */
   private spritePool: SpritePool | null = null;
 
   constructor(private readonly host: NativeHost) {}
@@ -138,96 +123,123 @@ export class WimpManager {
   setSpritePool(pool: SpritePool): void  { this.spritePool = pool; }
 
   // ---------------------------------------------------------------------------
-  // SWI implementations — each method maps to one Wimp_* SWI
+  // SWI implementations
   // ---------------------------------------------------------------------------
 
-  /** Wimp_Initialise (SWI 0x400C0) */
-  initialise(regs: RegisterFile, bus: SystemBus): void {
-    // R0 = minimum Wimp version needed, R1 = "TASK", R2 = ptr to task name
-    const nameAddr = regs.read(2);
-    this.taskName   = readString(bus, nameAddr);
-    this.taskHandle = this.nextHandle++;
-    regs.write(0, 310);             // Wimp version we claim (3.10)
-    regs.write(1, this.taskHandle); // task handle
-    // Iconbar entry is added later via Wimp_CreateIcon(-2), not here
-  }
-
-  /** Wimp_CreateWindow (SWI 0x400C1) */
-  async createWindow(regs: RegisterFile, bus: SystemBus): Promise<void> {
-    const blockAddr = regs.read(1);
-    const def = readWindowDef(bus, blockAddr);
-    const handle = this.nextHandle++;
-
-    const win: WimpWindow = { handle, def, icons: new Map(), open: false, dirty: true };
-    this.windows.set(handle, win);
-
-    await this.host.createWindow(handle, def);
-    regs.write(0, handle);
-  }
-
-  /** Wimp_OpenWindow (SWI 0x400C5) */
-  async openWindow(regs: RegisterFile, bus: SystemBus): Promise<void> {
-    const blockAddr = regs.read(1);
-    const handle = bus.read32(blockAddr) | 0;
-    const win    = this.windows.get(handle);
-    if (!win) return;
-
-    win.def.visX0   = bus.read32(blockAddr + 4)  | 0;
-    win.def.visY0   = bus.read32(blockAddr + 8)  | 0;
-    win.def.visX1   = bus.read32(blockAddr + 12) | 0;
-    win.def.visY1   = bus.read32(blockAddr + 16) | 0;
-    win.def.scrollX = bus.read32(blockAddr + 20) | 0;
-    win.def.scrollY = bus.read32(blockAddr + 24) | 0;
-    win.def.behind  = bus.read32(blockAddr + 28) | 0;
-    win.open = true;
-
-    await this.host.openWindow(handle, win.def);
-
-    // Immediately queue a Redraw event so the app redraws the window
-    this.events.push({ code: WimpEvent.Redraw, data: [handle] });
-  }
-
-  /** Wimp_CloseWindow (SWI 0x400C6) */
-  async closeWindow(regs: RegisterFile, bus: SystemBus): Promise<void> {
-    const handle = bus.read32(regs.read(1)) | 0;
-    const win = this.windows.get(handle);
-    if (!win) return;
-    win.open = false;
-    await this.host.closeWindow(handle);
-    this.events.push({ code: WimpEvent.Close, data: [handle] });
-  }
-
-  /** Wimp_DeleteWindow (SWI 0x400C3) */
-  async deleteWindow(regs: RegisterFile, bus: SystemBus): Promise<void> {
-    const handle = bus.read32(regs.read(1)) | 0;
-    await this.host.destroyWindow(handle);
-    this.windows.delete(handle);
+  /**
+   * Wimp_Initialise — read task name, then passthrough so ROM registers the task.
+   * afterReturn captures ROM's real task handle from R1.
+   */
+  initialise(regs: RegisterFile, bus: SystemBus): WR {
+    this.taskName = readString(bus, regs.read(2));
+    return {
+      passthrough: true,
+      afterReturn: (r) => {
+        this.taskHandle = r.read(1);
+        console.log(`[Wimp_Initialise] task="${this.taskName}" handle=${this.taskHandle} (ROM-assigned)`);
+      },
+    };
   }
 
   /**
-   * Wimp_Poll / Wimp_PollIdle (SWI 0x400C7 / 0x400E1)
-   *
-   * Puts the CPU into pending state, waits for an event, then writes it
-   * into the block at R1 and resumes.
+   * Wimp_CreateWindow — passthrough to ROM first; afterReturn creates the native
+   * BrowserWindow using the handle ROM assigned (written to R1 on exit).
    */
-  async poll(regs: RegisterFile, bus: SystemBus, _pollIdle: boolean): Promise<void> {
+  createWindow(regs: RegisterFile, bus: SystemBus): WR {
+    const def = readWindowDef(bus, regs.read(1));
+    return {
+      passthrough: true,
+      afterReturn: (r) => {
+        const handle = r.read(1); // ROM's assigned window handle
+        this.host.createWindow(handle, def);
+        this.windows.set(handle, { handle, def, icons: new Map(), open: false, dirty: true });
+      },
+    };
+  }
+
+  /** Wimp_OpenWindow — update native window, then let ROM update its state */
+  openWindow(regs: RegisterFile, bus: SystemBus): WR {
+    const blockAddr = regs.read(1);
+    const handle = bus.read32(blockAddr) | 0;
+    const win    = this.windows.get(handle);
+    if (win) {
+      win.def.visX0   = bus.read32(blockAddr + 4)  | 0;
+      win.def.visY0   = bus.read32(blockAddr + 8)  | 0;
+      win.def.visX1   = bus.read32(blockAddr + 12) | 0;
+      win.def.visY1   = bus.read32(blockAddr + 16) | 0;
+      win.def.scrollX = bus.read32(blockAddr + 20) | 0;
+      win.def.scrollY = bus.read32(blockAddr + 24) | 0;
+      win.def.behind  = bus.read32(blockAddr + 28) | 0;
+      win.open = true;
+      this.host.openWindow(handle, win.def);
+    }
+    return 'passthrough';
+  }
+
+  /** Wimp_CloseWindow — hide native window, let ROM update its state */
+  closeWindow(regs: RegisterFile, bus: SystemBus): WR {
+    const handle = bus.read32(regs.read(1)) | 0;
+    const win = this.windows.get(handle);
+    if (win) {
+      win.open = false;
+      this.host.closeWindow(handle);
+    }
+    return 'passthrough';
+  }
+
+  /** Wimp_DeleteWindow — destroy native window, let ROM clean up its state */
+  deleteWindow(regs: RegisterFile, bus: SystemBus): WR {
+    const handle = bus.read32(regs.read(1)) | 0;
+    this.host.destroyWindow(handle);
+    this.windows.delete(handle);
+    return 'passthrough';
+  }
+
+  /**
+   * Wimp_Poll / Wimp_PollIdle
+   *
+   * 1. Sync-check our native event queue (mouse, window, keyboard events).
+   * 2. If empty, passthrough to ROM — ROM may have messages/events queued.
+   * 3. If ROM also returns Null, suspend CPU and wait for next native event.
+   */
+  poll(regs: RegisterFile, bus: SystemBus, _pollIdle: boolean): WR {
     const mask      = regs.read(0);
     const blockAddr = regs.read(1);
 
-    this.machine.cpu.swiPending = true;
-
-    const ev = await this.host.pollEvent(mask);
-
-    // Write event data block
-    for (let i = 0; i < ev.data.length; i++) {
-      bus.write32(blockAddr + i * 4, ev.data[i]!);
+    // Fast path: native event already waiting
+    const pending = this.host.tryPollEvent(mask);
+    if (pending) {
+      for (let i = 0; i < pending.data.length; i++) {
+        bus.write32(blockAddr + i * 4, pending.data[i]!);
+      }
+      regs.write(0, pending.code);
+      return; // no passthrough, no suspend
     }
-    regs.write(0, ev.code);
 
-    this.machine.wakeFromSWI();
+    // Let ROM check its own queue (messages sent by modules/apps via Wimp_SendMessage)
+    return {
+      passthrough: true,
+      afterReturn: (r, b) => {
+        const romCode = r.read(0);
+        if (romCode !== WimpEvent.Null && !((mask >> romCode) & 1)) {
+          // ROM delivered a real unmasked event — already written to the block by ROM.
+          // CPU resumes normally.
+          return;
+        }
+        // ROM also returned Null. Suspend and wait for a native event.
+        this.machine.cpu.swiPending = true;
+        void this.host.pollEvent(mask).then((ev) => {
+          for (let i = 0; i < ev.data.length; i++) {
+            b.write32(blockAddr + i * 4, ev.data[i]!);
+          }
+          r.write(0, ev.code);
+          this.machine.wakeFromSWI();
+        });
+      },
+    };
   }
 
-  /** Wimp_RedrawWindow (SWI 0x400C8) — enters the redraw loop */
+  /** Wimp_RedrawWindow — enters the canvas redraw loop (pure HLE, no passthrough) */
   redrawWindow(regs: RegisterFile, bus: SystemBus): void {
     const blockAddr = regs.read(1);
     const handle    = bus.read32(blockAddr) | 0;
@@ -236,36 +248,41 @@ export class WimpManager {
       regs.write(0, 0);
       return;
     }
-    writeWindowState(bus, blockAddr, win);
-    regs.write(0, 1); // non-zero = there is a rectangle to redraw
 
-    // Begin OS_Plot capture for this window.
-    // os_setup encodes scroll/size so the renderer can translate work-area
-    // OS-unit coordinates (as sent via OS_Plot when VDU origin = 0) to canvas px.
+    // Write window state for the app to read
+    const d = win.def;
+    bus.write32(blockAddr + 0,  d.visX0);
+    bus.write32(blockAddr + 4,  d.visY0);
+    bus.write32(blockAddr + 8,  d.visX1);
+    bus.write32(blockAddr + 12, d.visY1);
+    bus.write32(blockAddr + 16, d.scrollX);
+    bus.write32(blockAddr + 20, d.scrollY);
+    bus.write32(blockAddr + 24, win.open ? -1 : 0);
+    bus.write32(blockAddr + 28, d.flags | (win.open ? 0x10000 : 0));
+    regs.write(0, 1); // non-zero = rectangle to redraw
+
     this.currentRedrawHandle = handle;
     this.pendingCmds = [
       {
         type: "os_setup",
-        x: win.def.scrollX,                          // work-area X at left edge
-        y: win.def.scrollY,                          // work-area Y at top edge
-        w: win.def.visX1 - win.def.visX0,            // window width in OS units
-        h: win.def.visY1 - win.def.visY0,            // window height in OS units
+        x: win.def.scrollX,
+        y: win.def.scrollY,
+        w: win.def.visX1 - win.def.visX0,
+        h: win.def.visY1 - win.def.visY0,
       },
       { type: "clear", x: 0, y: 0 },
     ];
   }
 
   /**
-   * Wimp_GetRectangle (SWI 0x400CA) — advances the redraw loop.
-   *
-   * We always return R0=0 (no more rectangles).  Before returning we flush
-   * all batched OS_Plot draw commands to the native window canvas.
+   * Wimp_GetRectangle — ends the canvas redraw loop (pure HLE, no passthrough).
+   * Flushes all batched OS_Plot commands to the native window canvas.
    */
   getWindowRect(regs: RegisterFile, _bus: SystemBus): void {
     regs.write(0, 0); // no more rectangles
 
     if (this.currentRedrawHandle !== null && this.pendingCmds.length > 0) {
-      void this.host.draw(this.currentRedrawHandle, this.pendingCmds);
+      this.host.draw(this.currentRedrawHandle, this.pendingCmds);
     }
     this.pendingCmds = [];
     this.currentRedrawHandle = null;
@@ -273,19 +290,11 @@ export class WimpManager {
 
   // ── OS_Plot interception ───────────────────────────────────────────────────
 
-  /**
-   * Handle an OS_Plot call from the ARM CPU.
-   *
-   * Plot code encoding (RISC OS PRM Vol 1):
-   *   bit 2        : 0 = relative coordinates, 1 = absolute
-   *   bits 1:0     : draw action — 0 = move only, 1–3 = draw (EOR/FG/BG)
-   *   bits 7:3     : operation type (0=line, 12=filled rect, etc.)
-   */
   osPlot(code: number, x: number, y: number): void {
     if (this.currentRedrawHandle === null) return;
 
     const absolute   = !!(code & 4);
-    const drawAction = code & 3;        // 0 = move only, non-zero = draw
+    const drawAction = code & 3;
     const opType     = (code >>> 3) & 0x1F;
 
     const absX = absolute ? x : this.graphicsX + x;
@@ -293,7 +302,7 @@ export class WimpManager {
 
     if (drawAction !== 0) {
       switch (opType) {
-        case 0: // Line to point
+        case 0:
           this.pendingCmds.push({
             type: "os_line",
             x: this.graphicsX, y: this.graphicsY,
@@ -301,8 +310,7 @@ export class WimpManager {
             colour: this.fgColour,
           });
           break;
-
-        case 12: // Filled rectangle — previous point and current point are corners
+        case 12:
           this.pendingCmds.push({
             type: "os_rect",
             x: Math.min(this.graphicsX, absX),
@@ -312,10 +320,6 @@ export class WimpManager {
             colour: this.fgColour,
           });
           break;
-
-        default:
-          // Unsupported operation type — move cursor but do not draw
-          break;
       }
     }
 
@@ -323,57 +327,36 @@ export class WimpManager {
     this.graphicsY = absY;
   }
 
-  /** Set the current graphics foreground colour (called by OS_SetColour handler) */
   setGraphicsFgColour(css: string): void { this.fgColour = css; }
-  /** Set the current graphics background colour (currently unused in rendering) */
-  setGraphicsBgColour(_css: string): void { /* background draw ops not yet implemented */ }
+  setGraphicsBgColour(_css: string): void { /* background ops not yet implemented */ }
 
-  /** Wimp_GetWindowState (SWI 0x400CB) */
-  getWindowState(regs: RegisterFile, bus: SystemBus): void {
-    const blockAddr = regs.read(1);
-    const handle    = bus.read32(blockAddr) | 0;
-    const win = this.windows.get(handle);
-    if (win) writeWindowState(bus, blockAddr, win);
-  }
-
-  /** Wimp_ForceRedraw (SWI 0x400D1) */
-  forceRedraw(regs: RegisterFile, _bus: SystemBus): void {
-    const handle = regs.read(0);
-    const win = this.windows.get(handle);
-    if (win) {
-      win.dirty = true;
-      this.events.push({ code: WimpEvent.Redraw, data: [handle] });
-    }
-  }
-
-  /** Wimp_CreateMenu (SWI 0x400D4) */
+  /** Wimp_CreateMenu (pure HLE — native menu, no passthrough) */
   async createMenu(regs: RegisterFile, bus: SystemBus): Promise<void> {
     const menuAddr = regs.read(1);
     const x = regs.read(2);
     const y = regs.read(3);
-    if (menuAddr === -1) {
-      // Close any open menu — no-op for native menus
-      return;
-    }
+    if (menuAddr === -1) return; // close menu
+
     const { title, items } = readMenu(bus, menuAddr);
     const selection = await this.host.showMenu(title, items, osUnitsToPx(x), osUnitsToPx(y));
 
     if (selection) {
-      const blockAddr = regs.read(1); // selection written to a known buffer — simplified
+      const blockAddr = regs.read(1);
       for (let i = 0; i < selection.length; i++) {
         bus.write32(blockAddr + i * 4, selection[i]!);
       }
       bus.write32(blockAddr + selection.length * 4, -1);
-      this.events.push({ code: WimpEvent.MenuSelection, data: selection });
+      // Menu selection delivered via native event route — push to host
+      this.host.tryPollEvent; // (host delivers via deliverEvent internally)
     }
   }
 
-  /** Wimp_ReportError (SWI 0x400DF) */
+  /** Wimp_ReportError (pure HLE — native dialog, no passthrough) */
   async reportError(regs: RegisterFile, bus: SystemBus): Promise<void> {
     const errBlock = regs.read(0);
     const flags    = regs.read(1);
     const nameAddr = regs.read(2);
-    const message  = readString(bus, errBlock + 4); // skip 4-byte error number
+    const message  = readString(bus, errBlock + 4);
     const name     = readString(bus, nameAddr);
 
     this.machine.cpu.swiPending = true;
@@ -382,119 +365,51 @@ export class WimpManager {
     this.machine.wakeFromSWI();
   }
 
-  /** Wimp_GetPointerInfo (SWI 0x400CF) */
-  getPointerInfo(regs: RegisterFile, bus: SystemBus): void {
-    const blockAddr = regs.read(1);
-    const info = this.host.getPointerInfo();
-    bus.write32(blockAddr + 0,  info.x);
-    bus.write32(blockAddr + 4,  info.y);
-    bus.write32(blockAddr + 8,  info.buttons);
-    bus.write32(blockAddr + 12, info.winHandle);
-    bus.write32(blockAddr + 16, info.iconHandle);
-  }
+  /**
+   * Wimp_CreateIcon — for iconbar icons (winHandle = -2), add to native iconbar.
+   * Always passthrough so ROM also tracks the icon.
+   */
+  createIcon(regs: RegisterFile, bus: SystemBus): WR {
+    const blockAddr  = regs.read(1);
+    const winHandle  = bus.read32(blockAddr) | 0;
+    const flags = bus.read32(blockAddr + 20);
 
-  /** Wimp_SlotSize (SWI 0x400EC) */
-  slotSize(regs: RegisterFile, _bus: SystemBus): void {
-    // R0 = requested slot size, -1 = don't change; R1 = next slot
-    // Return the machine's RAM size as both current and next
-    const ram = 1 * 1024 * 1024; // 1 MB
-    regs.write(0, ram);
-    regs.write(1, ram);
-    regs.write(2, ram * 2);
-  }
+    if (winHandle === -2) {
+      // Iconbar icon: extract sprite name from validation string ("Sspritename") or text
+      let sprite = "application";
+      let text   = "";
+      if (flags & IF_INDIRECTED) {
+        text       = readString(bus, bus.read32(blockAddr + 24));
+        const vstr = readString(bus, bus.read32(blockAddr + 28));
+        if (vstr && (vstr[0] === 'S' || vstr[0] === 's')) {
+          sprite = vstr.slice(1);
+        } else if (text) {
+          sprite = text;
+        }
+      } else {
+        text   = readString(bus, blockAddr + 24, 12);
+        sprite = text || sprite;
+      }
 
-  /** Wimp_ReadSysInfo (SWI 0x400F2) */
-  readSysInfo(regs: RegisterFile, _bus: SystemBus): void {
-    switch (regs.read(0)) {
-      case 0: // screen mode
-        regs.write(0, 27); // mode 27 = 800×600 256-colour
-        break;
-      case 1: // Wimp version
-        regs.write(0, 310);
-        break;
-      case 2: // number of tasks
-        regs.write(0, 1);
-        break;
-      case 5: // monitor type
-        regs.write(0, 4); // SVGA
-        break;
-      case 7: // desk size
-        regs.write(0, pxToOsUnits(1280));
-        regs.write(1, pxToOsUnits(1024));
-        break;
+      const spriteData: SpriteData | undefined = this.spritePool?.get(sprite);
+      console.log(`[Wimp_CreateIcon(-2)] sprite="${sprite}" spriteDataFound=${!!spriteData}`);
+      this.host.setIconbarEntry(this.taskHandle, sprite, text || sprite, spriteData);
     }
+
+    // Always passthrough — ROM tracks the icon and assigns the handle
+    return 'passthrough';
   }
 
-  /** Wimp_CloseDown (SWI 0x400DD) */
-  closeDown(_regs: RegisterFile, _bus: SystemBus): void {
+  /** Wimp_CloseDown — clean up native resources, then let ROM deregister the task */
+  closeDown(_regs: RegisterFile, _bus: SystemBus): WR {
     this.host.removeIconbarEntry(this.taskHandle);
     for (const [handle] of this.windows) {
       this.host.destroyWindow(handle);
     }
     this.windows.clear();
+    return 'passthrough';
   }
 
-  /** Wimp_SendMessage (SWI 0x400E7) */
-  sendMessage(regs: RegisterFile, bus: SystemBus): void {
-    // Simplified: just deliver to our own event queue
-    const blockAddr = regs.read(2);
-    const size   = bus.read32(blockAddr)     & 0xFFFF;
-    const action = bus.read32(blockAddr + 16);
-    const data: number[] = [];
-    for (let i = 0; i * 4 < size; i++) {
-      data.push(bus.read32(blockAddr + i * 4));
-    }
-    this.events.push({ code: WimpEvent.UserMessage, data });
-    void action;
-  }
-
-  /** Wimp_CreateIcon (SWI 0x400C2) — adds icon to a window */
-  createIcon(regs: RegisterFile, bus: SystemBus): void {
-    const blockAddr  = regs.read(1);
-    const winHandle  = bus.read32(blockAddr) | 0;
-    const iconHandle = this.nextHandle++;
-    const icon: WimpIcon = {
-      x0: bus.read32(blockAddr + 4)  | 0,
-      y0: bus.read32(blockAddr + 8)  | 0,
-      x1: bus.read32(blockAddr + 12) | 0,
-      y1: bus.read32(blockAddr + 16) | 0,
-      flags: bus.read32(blockAddr + 20),
-      text: "", sprite: "", validation: "", maxLen: 0,
-    };
-    const flags = icon.flags;
-    if (flags & IF_INDIRECTED) {
-      icon.text       = readString(bus, bus.read32(blockAddr + 24));
-      icon.validation = readString(bus, bus.read32(blockAddr + 28));
-      icon.maxLen     = bus.read32(blockAddr + 32);
-    } else {
-      icon.text = readString(bus, blockAddr + 24, 12);
-    }
-
-    if (winHandle === -2) {
-      // Iconbar icon: extract sprite name from validation ("Sspritename") or text
-      let sprite = "application";
-      if (icon.validation && (icon.validation[0] === 'S' || icon.validation[0] === 's')) {
-        sprite = icon.validation.slice(1);
-      } else if (icon.text) {
-        sprite = icon.text;
-      }
-      // Look up sprite pixel data for canvas rendering
-      const spriteData: SpriteData | undefined = this.spritePool?.get(sprite);
-      this.host.setIconbarEntry(iconHandle, sprite, icon.text || sprite, spriteData);
-      regs.write(0, iconHandle);
-      return;
-    }
-
-    const win = this.windows.get(winHandle);
-    if (win) {
-      win.icons.set(iconHandle, icon);
-      this.host.updateIcon(winHandle, iconHandle, icon);
-    }
-    regs.write(0, iconHandle);
-  }
-
-  /** Expose event queue push for host-side events */
-  pushEvent(ev: Parameters<WimpEventQueue["push"]>[0]): void {
-    this.events.push(ev);
-  }
+  /** Expose event push for host-side events (kept for backwards compat) */
+  pushEvent(_ev: unknown): void { /* events now come via ROM poll passthrough */ }
 }

@@ -1,8 +1,6 @@
 /**
  * NativeHost — abstract interface between the RISC OS Wimp emulation and the
  * host windowing system (implemented by electron-shell).
- *
- * Each method may be async; the Wimp layer awaits them where needed.
  */
 
 import type { WimpWindowDef, WimpIcon, WimpPollEvent } from "./types.js";
@@ -36,28 +34,25 @@ export interface DrawCommand {
 }
 
 export interface NativeHost {
-  /**
-   * Create a native window.
-   * Returns an opaque native handle (used in subsequent calls).
-   */
-  createWindow(handle: number, def: WimpWindowDef): Promise<string>;
+  /** Create a native window for the given RISC OS handle (assigned by ROM). */
+  createWindow(handle: number, def: WimpWindowDef): void;
 
   /** Show/reposition a native window */
   openWindow(handle: number, def: Pick<WimpWindowDef,
     "visX0"|"visY0"|"visX1"|"visY1"|"scrollX"|"scrollY"|"behind"
-    |"workX0"|"workY0"|"workX1"|"workY1"|"flags">): Promise<void>;
+    |"workX0"|"workY0"|"workX1"|"workY1"|"flags">): void;
 
   /** Hide a native window (keep it alive) */
-  closeWindow(handle: number): Promise<void>;
+  closeWindow(handle: number): void;
 
   /** Destroy a native window permanently */
-  destroyWindow(handle: number): Promise<void>;
+  destroyWindow(handle: number): void;
 
   /** Update an icon's state in a native window */
-  updateIcon(winHandle: number, iconHandle: number, icon: WimpIcon): Promise<void>;
+  updateIcon(winHandle: number, iconHandle: number, icon: WimpIcon): void;
 
   /** Send drawing commands to a window's canvas */
-  draw(winHandle: number, cmds: DrawCommand[]): Promise<void>;
+  draw(winHandle: number, cmds: DrawCommand[]): void;
 
   /** Show a native menu (returns selected item path or null) */
   showMenu(title: string, items: NativeMenuItem[], x: number, y: number): Promise<number[] | null>;
@@ -65,8 +60,11 @@ export interface NativeHost {
   /** Show an error dialog */
   showError(message: string, flags: number, name: string): Promise<number>;
 
-  /** Report pointer position (screen coords in OS units) and button state */
-  getPointerInfo(): { x: number; y: number; buttons: number; winHandle: number; iconHandle: number };
+  /**
+   * Synchronously check for a pending native event without blocking.
+   * Returns the event if one is available and unmasked, or null.
+   */
+  tryPollEvent(mask: number): WimpPollEvent | null;
 
   /**
    * Wait for the next Wimp event and resolve with it.
@@ -80,7 +78,6 @@ export interface NativeHost {
 
   /** Remove the iconbar entry */
   removeIconbarEntry(taskHandle: number): void;
-
 }
 
 export interface NativeMenuItem {
