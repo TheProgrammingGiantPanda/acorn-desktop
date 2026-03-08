@@ -71,7 +71,7 @@ function createLauncherWindow(): BrowserWindow {
 
   if (isDev) {
     win.loadURL("http://localhost:5173/index.html");
-    win.webContents.openDevTools({ mode: "detach" });
+    win.webContents.openDevTools({ mode: "bottom" });
   } else {
     win.loadFile(path.join(__dirname, "../../renderer/index.html"));
   }
@@ -151,7 +151,7 @@ function createProgramsBrowserWindow(): BrowserWindow {
 
   if (isDev) {
     win.loadURL("http://localhost:5173/programs-browser.html");
-    win.webContents.once("did-finish-load", () => win.webContents.openDevTools({ mode: "detach" }));
+    win.webContents.once("did-finish-load", () => win.webContents.openDevTools({ mode: "bottom" }));
   } else {
     win.loadFile(path.join(__dirname, "../../renderer/programs-browser.html"));
   }
