@@ -165,7 +165,7 @@ export class SwiDispatcher {
       (r, b) => { void w.reportError(r, b); });
 
     // ── Sprite operations ─────────────────────────────────────────────────────
-    const spriteHandler = new OSSpriteHandler(this.spritePool);
+    const spriteHandler = new OSSpriteHandler(this.spritePool, fs);
     cpu.swiHandlers.set(SWI.OS_SpriteOp,  (r, b) => spriteHandler.handleOS(r, b));
     cpu.swiHandlers.set(SWI.Wimp_SpriteOp,(r, b) => spriteHandler.handleWimp(r, b));
 

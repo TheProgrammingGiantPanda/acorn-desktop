@@ -12,6 +12,9 @@
  * is clear.
  *
  * Reason codes implemented:
+ *   2   Save sprite area to file  (R2=filename — stub; pool is decode-only)
+ *   10  Load sprite file          (R2=filename → replaces pool contents from file)
+ *   11  Merge sprite file         (R2=filename → adds/replaces sprites from file)
  *   13  Return name of nth sprite (R2=buf, R3=buflen, R4=index → R3=len)
  *   24  Select sprite by name    (R2=name → R2=sprite handle if user area; C clear if found)
  *   28  Put sprite at current coords (stub — no canvas pipeline yet)
@@ -22,6 +25,7 @@
  */
 
 import type { SpritePool } from './sprite-pool.js';
+import type { FileSystemHost } from '../fs/fs-host.js';
 
 interface Regs {
   read(n: number): number;
@@ -35,7 +39,10 @@ interface Bus {
 }
 
 export class OSSpriteHandler {
-  constructor(private readonly pool: SpritePool) {}
+  constructor(
+    private readonly pool: SpritePool,
+    private readonly fs?: FileSystemHost,
+  ) {}
 
   /** Handle OS_SpriteOp (any reason code). */
   handleOS(regs: Regs, bus: Bus): void {
@@ -60,6 +67,9 @@ export class OSSpriteHandler {
     const nameInR2  = (r0 & 0x200) === 0;
 
     switch (reason) {
+      case  2: /* save — pool is decode-only, cannot re-encode */ break;
+      case 10: this.loadFile(regs, bus, /* merge */ false); break;
+      case 11: this.loadFile(regs, bus, /* merge */ true);  break;
       case 13: this.nameByNumber(regs, bus); break;
       case 24: this.selectSprite(regs, bus, nameInR2); break;
       case 28:
@@ -69,6 +79,26 @@ export class OSSpriteHandler {
       case 40: this.readInfo(regs, bus, nameInR2); break;
       // All other reason codes: silently ignore
     }
+  }
+
+  /**
+   * Reasons 10 (load) and 11 (merge): load a sprite file into the pool.
+   * R2 = RISC OS path to sprite file.
+   * For reason 10 the real OS clears the area first; since our pool is
+   * name-keyed, both operations effectively merge (same-name sprites replaced).
+   */
+  private loadFile(regs: Regs, bus: Bus, _merge: boolean): void {
+    if (!this.fs) return;
+    const path = readCString(bus, regs.read(2));
+    let data: Uint8Array;
+    try {
+      data = this.fs.readFile(path);
+    } catch {
+      regs.C = true;
+      return;
+    }
+    this.pool.loadArea(data);
+    regs.C = false;
   }
 
   /** Reason 13: return name of nth sprite (R2=buf, R3=buflen, R4=sprite index → R3=len). */
