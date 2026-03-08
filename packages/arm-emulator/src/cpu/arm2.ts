@@ -16,8 +16,13 @@ import { RegisterFile, Mode, PC_MASK, IRQ_MASK_BIT, FIQ_MASK_BIT } from "./regis
 import type { SystemBus } from "../memory/bus.js";
 import { Logger } from "@theprogramminggiantpanda/shared";
 
-/** A SWI handler receives the live register file and system bus. */
-export type SwiHandler = (regs: RegisterFile, bus: SystemBus) => void;
+/**
+ * A SWI handler receives the live register file and system bus.
+ * Returning `'passthrough'` causes the CPU to fall through to the ROM's own
+ * SWI vector, which is useful when a handler wants to service only a subset
+ * of calls (e.g. HostFS for "HostFS::" paths, ROM FileSwitch for everything else).
+ */
+export type SwiHandler = (regs: RegisterFile, bus: SystemBus) => 'passthrough' | void;
 
 /** Exception vector addresses (ARM2 standard) */
 const VECTOR_RESET   = 0x00000000;
@@ -421,14 +426,14 @@ export class ARM2CPU {
     const handler = this.swiHandlers.get(swiNum);
     if (!this._swiSeen.has(swiNum)) {
       this._swiSeen.add(swiNum);
-      const tag = handler ? "handled" : "UNHANDLED";
+      const tag = handler ? "→JS" : "→ROM";
       this.logger.debug(`[SWI] 0x${swiNum.toString(16).padStart(6,'0')} ${tag}`);
     }
     if (handler) {
-      handler(this.regs, this.bus);
-    } else {
-      this.takeException(VECTOR_SWI, Mode.Supervisor);
+      const result = handler(this.regs, this.bus);
+      if (result !== 'passthrough') return;
     }
+    this.takeException(VECTOR_SWI, Mode.Supervisor);
   }
 
   /** Resume after an async SWI completes (called externally) */

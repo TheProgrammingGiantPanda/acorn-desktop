@@ -1,7 +1,7 @@
 /**
  * Application menu for the Acorn Desktop launcher window
  */
-import { Menu, app, shell } from "electron";
+import { Menu, app, shell, BrowserWindow as BW } from "electron";
 import type { BrowserWindow } from "electron";
 
 interface MenuCallbacks {
@@ -53,7 +53,11 @@ export function buildAppMenu(win: BrowserWindow | null, cb: MenuCallbacks): Menu
     {
       label: "&View",
       submenu: [
-        { role: "toggleDevTools" },
+        {
+          label: "Toggle Developer Tools",
+          accelerator: process.platform === "darwin" ? "Alt+Command+I" : "Ctrl+Shift+I",
+          click: () => BW.getFocusedWindow()?.webContents.toggleDevTools(),
+        },
         { type: "separator" },
         {
           label: "Full Screen",

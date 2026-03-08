@@ -26,6 +26,9 @@
 export type IocIrqCallback = () => void;
 
 export class IOC {
+  // Control register (offset 0x00)
+  private control = 0xFF; // pull-ups give 0xFF on reset
+
   // Interrupt registers
   private irqAStatus  = 0x00;
   private irqARequest = 0x00;
@@ -71,6 +74,7 @@ export class IOC {
 
   read(offset: number): number {
     switch (offset & 0xFF) {
+      case 0x00: return this.control;
       case 0x10: return this.irqAStatus;
       case 0x14: { const r = this.irqARequest; this.irqARequest = 0; return r; }
       case 0x18: return this.irqAMask;
@@ -97,6 +101,7 @@ export class IOC {
 
   write(offset: number, value: number): void {
     switch (offset & 0xFF) {
+      case 0x00: this.control = value & 0xFF; break;
       case 0x18: this.irqAMask = value & 0xFF; break;
       case 0x28: this.irqBMask = value & 0xFF; break;
       case 0x38: this.fiqMask  = value & 0xFF; break;
@@ -169,7 +174,12 @@ export class IOC {
   }
 
   reset(): void {
-    this.irqAStatus = this.irqARequest = this.irqAMask = 0;
+    this.control    = 0xFF;
+    // Power-on reset: IRQA_POWER_ON is asserted so the ROM knows this is a
+    // cold start rather than a soft reset.
+    this.irqAStatus  = IOC.IRQA_POWER_ON;
+    this.irqARequest = IOC.IRQA_POWER_ON;
+    this.irqAMask    = 0;
     this.irqBStatus = this.irqBRequest = this.irqBMask = 0;
     this.fiqStatus  = this.fiqRequest  = this.fiqMask  = 0;
     this.timerLatch.fill(0);

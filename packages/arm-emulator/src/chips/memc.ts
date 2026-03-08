@@ -42,6 +42,13 @@ interface CamEntry {
 export class MEMC {
   control = 0;
 
+  /**
+   * Called once when the ROM alias should be released.
+   * The system bus sets this to clear its `romActive` flag.
+   * On real hardware any write to the MEMC control register removes the alias.
+   */
+  onRomAliasRelease?: () => void;
+
   /** Video DMA start address (physical) */
   videoDMAStart = 0x0200_0000;
   /** Video DMA end address (physical) */
@@ -94,6 +101,8 @@ export class MEMC {
   writeControl(offset: number, value: number): void {
     switch (offset & 0xFF) {
       case 0x00:
+        // Any write to the MEMC control register releases the ROM alias.
+        this.onRomAliasRelease?.();
         this.control = value;
         break;
       case 0x04:

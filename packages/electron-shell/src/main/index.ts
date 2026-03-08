@@ -12,6 +12,7 @@ import { ArchimedesMachine } from "@theprogramminggiantpanda/arm-emulator";
 import { SwiDispatcher, ObeyInterpreter, SpritePool } from "@theprogramminggiantpanda/risc-os";
 import { NativeWimpHost } from "./native-wimp-host.js";
 import { NodeFsHost } from "./node-fs-host.js";
+import { HostFsHandler } from "./hostfs-handler.js";
 import { buildAppMenu } from "./menu.js";
 import type { MachineConfig, AppEntry } from "@theprogramminggiantpanda/shared";
 import { IPC, Logger } from "@theprogramminggiantpanda/shared";
@@ -70,7 +71,7 @@ function createLauncherWindow(): BrowserWindow {
 
   if (isDev) {
     win.loadURL("http://localhost:5173/index.html");
-    win.webContents.openDevTools({ mode: "detach" });
+    win.webContents.openDevTools({ mode: "bottom" });
   } else {
     win.loadFile(path.join(__dirname, "../../renderer/index.html"));
   }
@@ -150,6 +151,7 @@ function createProgramsBrowserWindow(): BrowserWindow {
 
   if (isDev) {
     win.loadURL("http://localhost:5173/programs-browser.html");
+    win.webContents.once("did-finish-load", () => win.webContents.openDevTools({ mode: "bottom" }));
   } else {
     win.loadFile(path.join(__dirname, "../../renderer/programs-browser.html"));
   }
@@ -215,12 +217,16 @@ function startMachine(romData: Uint8Array, appHostPath?: string): void {
 
   machine    = new ArchimedesMachine(config, logger);
   wimpHost   = new NativeWimpHost();
+  // obeyFs gives the ObeyInterpreter access to !Run / !Boot scripts on disk.
+  // fs is intentionally omitted: in ROM boot mode the real ROM FileSwitch
+  // handles OS_File / OS_Find / etc.; HostFsHandler (registered below)
+  // intercepts only HostFS:: paths and passes everything else through to ROM.
   dispatcher = new SwiDispatcher(machine, wimpHost, {
     onOutput: (text) => {
       logger.debug(`[RISC OS] ${text}`);
       launcherWindow?.webContents.send("console-output", text);
     },
-    fs: nodeFs,
+    obeyFs: nodeFs,
     onRunBinary: (riscosPath) => {
       logger.debug(`[onRunBinary] loading: ${riscosPath}`);
       try {
@@ -240,8 +246,13 @@ function startMachine(romData: Uint8Array, appHostPath?: string): void {
     },
   });
 
+  // Register HostFS: intercepts OS_File/OS_Find/OS_GBPB/OS_Args for "HostFS::"
+  // paths, passes everything else through to the real ROM FileSwitch.
+  const hostfs = new HostFsHandler(fsRoot);
+  hostfs.register(machine);
+
   machine.loadROM(romData);
-  machine.start();
+  machine.bootROM();
 
   bootAllApps();
 
