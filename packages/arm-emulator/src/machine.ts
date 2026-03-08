@@ -99,6 +99,50 @@ export class ArchimedesMachine {
     this.bus.dmaWrite(addr, data);
   }
 
+  /**
+   * Write data to physical RAM at the given offset (bypassing MEMC).
+   * The data will be accessible at the same logical address when that logical
+   * address >= 0x80000 (in the emulator's linear-mapped region).
+   */
+  writePhysical(physOffset: number, data: Uint8Array): void {
+    this.bus.dmaWrite(physOffset, data);
+  }
+
+  /**
+   * Run a brief ARM routine at the given logical address.
+   * Assumes the CPU is currently suspended (swiPending = true).
+   * The routine should end with SWI sentinelSwiNum.
+   * Resolves when the sentinel SWI fires.
+   * Restores CPU registers on completion.
+   */
+  runArmCallback(routineLogicalAddr: number, sentinelSwiNum: number): Promise<void> {
+    return new Promise((resolve) => {
+      const savedR15 = this.cpu.regs.r15;
+      const savedR0  = this.cpu.regs.read(0);
+      const savedR1  = this.cpu.regs.read(1);
+      const savedR2  = this.cpu.regs.read(2);
+      const savedR3  = this.cpu.regs.read(3);
+
+      this.cpu.swiHandlers.set(sentinelSwiNum, () => {
+        this.cpu.swiHandlers.delete(sentinelSwiNum);
+        // Restore saved registers
+        this.cpu.regs.r15 = savedR15;
+        this.cpu.regs.write(0, savedR0);
+        this.cpu.regs.write(1, savedR1);
+        this.cpu.regs.write(2, savedR2);
+        this.cpu.regs.write(3, savedR3);
+        // Re-suspend CPU — caller will resume normally
+        this.cpu.swiPending = true;
+        resolve();
+      });
+
+      // Set PC to our routine (keep current flags/mode in R15)
+      this.cpu.regs.pc = routineLogicalAddr;
+      // Resume CPU to execute the routine
+      this.wakeFromSWI();
+    });
+  }
+
   /** Register a SWI handler by SWI number */
   registerSWI(swiNum: number, handler: SwiHandler): void {
     this.cpu.swiHandlers.set(swiNum, handler);

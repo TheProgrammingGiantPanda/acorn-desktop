@@ -34,6 +34,11 @@ export interface DispatcherOptions {
   fs?: FileSystemHost;
   /** Called when an Obey Run command targets an ARM binary */
   onRunBinary?: (riscosPath: string) => void;
+  /**
+   * Called when Service_StartFiler (&4D) is broadcast — the Filer has started
+   * and modules should add their disc icons to the iconbar.
+   */
+  onServiceStartFiler?: () => void;
 }
 
 export class SwiDispatcher {
@@ -59,10 +64,10 @@ export class SwiDispatcher {
       spritePool:  this.spriteAreas.system,
       modules:     this.modules,
     });
-    this.registerAll(options.onOutput ?? (() => {}), options.fs);
+    this.registerAll(options.onOutput ?? (() => {}), options.fs, options);
   }
 
-  private registerAll(output: OutputCallback, fs?: FileSystemHost): void {
+  private registerAll(output: OutputCallback, fs?: FileSystemHost, options: DispatcherOptions = {}): void {
     const m = this.machine;
     const cpu = m.cpu;
 
@@ -79,8 +84,17 @@ export class SwiDispatcher {
     cpu.swiHandlers.set(SWI.OS_Mouse,        os.OS_Mouse);
     cpu.swiHandlers.set(SWI.OS_ReadModeVar,  os.OS_ReadModeVar);
     cpu.swiHandlers.set(SWI.OS_Heap,         os.OS_Heap);
-    cpu.swiHandlers.set(SWI.OS_Module,       os.OS_Module);
     cpu.swiHandlers.set(SWI.OS_WriteN,       os.OS_WriteN);
+
+    // OS_ServiceCall (SWI &30): intercept Service_StartFiler then pass to ROM
+    cpu.swiHandlers.set(SWI.OS_ServiceCall, (regs) => {
+      const service = regs.read(1) >>> 0;
+      // Service_StartFiler = 0x4D: Filer is starting, modules should add disc icons
+      if (service === 0x4D) {
+        options.onServiceStartFiler?.();
+      }
+      return 'passthrough'; // Always let ROM dispatch to modules too
+    });
 
     // ── System variables ──────────────────────────────────────────────────────
     const { sysvar, obey } = this;
