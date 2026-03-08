@@ -12,14 +12,14 @@
  *   RMEnsure <n> <v> [<cmd>]  — ensure module version present (stub)
  *   WimpSlot [-min n] [-max n] — set Wimp slot size (stub)
  *   If <cond> Then <c> [Else <c>] — conditional
- *   IfThere <path> Then <cmd>  — conditional file-existence test
  *   Error [<n>] <msg>          — report error
  *   Echo <text>                — print text
  *   IconSprites <path>         — load app sprites into the sprite pool
- *   BootObey <path>            — run an Obey file (alias for Run)
- *   FX <n> [<r1> [<r2>]]      — OS_Byte call (stub)
- *   AppSize / Repeat / AddApp  — stubs (no-op)
  *   | <comment>                — ignored
+ *
+ * This interpreter is used only for pre-boot !Boot scripts (bootAllApps).
+ * In ROM boot mode, app launching goes through the ROM's own CLI handler
+ * (machine.execCLI) which handles *FX, *IfThere, *RMLoad, etc. natively.
  */
 
 import type { FileSystemHost } from '../fs/fs-host.js';
@@ -101,20 +101,9 @@ export class ObeyInterpreter {
       case 'RMENSURE':    this.cmdRMEnsure(rest.trim()); break;
       case 'WIMPSLOT':    /* stub — slot sizing handled by Wimp */ break;
       case 'IF':          this.cmdIf(rest); break;
-      case 'IFTHERE':     this.cmdIfThere(rest.trim()); break;
       case 'ERROR':       this.cmdError(rest.trim()); break;
       case 'ECHO':        this.output(rest.trim() + '\r\n'); break;
       case 'ICONSPRITES': this.cmdIconSprites(rest.trim()); break;
-      case 'BOOTOBEY':    this.cmdRun(rest.trim()); break;
-      // Stubs for OS utility commands — no meaningful action in emulator
-      case 'FX':
-      case 'APPSIZE':
-      case 'REPEAT':
-      case 'ADDAPP':
-      case 'ADDFSX':
-      case 'SHADOW':
-      case 'WREN':
-        break;
       default:
         // '/path' is RISC OS shorthand for 'Run path'
         if (line.startsWith('/')) {
@@ -156,16 +145,6 @@ export class ObeyInterpreter {
     } else {
       this.runBinary(path);
     }
-  }
-
-  private cmdIfThere(args: string): void {
-    // IfThere <path> Then <cmd>
-    const m = args.match(/^(\S+)\s+Then\s+(.+)$/i);
-    if (!m) return;
-    const filePath = this.resolvePathVar(m[1]!);
-    const thenCmd  = m[2]!.trim();
-    const exists   = this.fs ? this.fs.stat(filePath) !== null : false;
-    if (exists) this.executeLine(thenCmd);
   }
 
   private cmdIconSprites(rawPath: string): void {

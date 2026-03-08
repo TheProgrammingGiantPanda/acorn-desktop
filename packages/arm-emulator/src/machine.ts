@@ -109,6 +109,40 @@ export class ArchimedesMachine {
   }
 
   /**
+   * Execute a RISC OS CLI command via the ROM's own CLI handler.
+   *
+   * Writes a tiny ARM stub + null-terminated command string to a scratch area
+   * in RAM (0x7E000) and wakes the CPU to execute it.  The stub calls
+   * SWI OS_CLI which passthroughs to ROM — the ROM's Obey interpreter handles
+   * *commands, !Run scripts, and ARM binaries natively.
+   *
+   * The CPU must be suspended (swiPending = true) before calling this method,
+   * which is the normal state while the Wimp desktop is idle in Wimp_Poll.
+   */
+  execCLI(command: string): void {
+    if (!this.cpu.swiPending) return; // CPU is running — cannot safely inject
+
+    const SCRATCH = 0x7E000; // scratch area just below the HostFS module
+    const enc = new TextEncoder().encode(command + '\0');
+    const stub = new Uint8Array(12 + enc.length);
+    const view = new DataView(stub.buffer);
+
+    // ADD R0, PC, #4  — when this executes, PC = SCRATCH+8, so R0 = SCRATCH+12
+    view.setUint32(0, 0xE28F0004, true);
+    // SWI OS_CLI (0x05) — passthroughs to ROM in ROM boot mode
+    view.setUint32(4, 0xEF000005, true);
+    // B . — infinite loop / halt if OS_CLI ever returns (e.g. non-Wimp command)
+    view.setUint32(8, 0xEAFFFFFE, true);
+    stub.set(enc, 12);
+
+    this.bus.dmaWrite(SCRATCH, stub);
+    // Point LR at the halt so unexpected returns land safely
+    this.cpu.regs.write(14, SCRATCH + 8);
+    this.cpu.regs.pc = SCRATCH;
+    this.wakeFromSWI();
+  }
+
+  /**
    * Run a brief ARM routine at the given logical address.
    * Assumes the CPU is currently suspended (swiPending = true).
    * The routine should end with SWI sentinelSwiNum.

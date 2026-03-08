@@ -99,10 +99,9 @@ export class SwiDispatcher {
     // ── System variables ──────────────────────────────────────────────────────
     const { sysvar, obey } = this;
 
-    cpu.swiHandlers.set(SWI.OS_CLI, (regs, bus) => {
-      const cmd = readCString(bus, regs.read(0));
-      obey.executeLine(cmd);
-    });
+    // OS_CLI: passthrough to ROM — the ROM's CLI handler interprets *commands,
+    // Obey scripts, and ARM binaries natively.  We must not intercept it here
+    // or we shadow the ROM's own command processing in ROM boot mode.
 
     cpu.swiHandlers.set(SWI.OS_ReadVarVal, (regs, bus) => {
       const name  = readCString(bus, regs.read(0));
@@ -203,7 +202,8 @@ export class SwiDispatcher {
       SWI.Wimp_DragBox, SWI.Wimp_SetCaretPosition, SWI.Wimp_GetCaretPosition,
       SWI.Wimp_DecodeMenu, SWI.Wimp_WhichIcon, SWI.Wimp_SetExtent,
       SWI.Wimp_SetPointerShape, SWI.Wimp_OpenTemplate, SWI.Wimp_CloseTemplate,
-      SWI.Wimp_LoadTemplate, SWI.Wimp_ProcessKey, SWI.Wimp_StartTask,
+      SWI.Wimp_LoadTemplate, SWI.Wimp_ProcessKey,
+      // Wimp_StartTask (0x400DE) is intentionally absent — passthrough to ROM
       SWI.Wimp_GetWindowOutline, SWI.Wimp_PlotIcon, SWI.Wimp_SetMode,
       SWI.Wimp_CreateSubMenu, SWI.Wimp_SetFontColours,
       SWI.Wimp_GetMenuState, SWI.Wimp_TextColour,

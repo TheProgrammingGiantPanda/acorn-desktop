@@ -242,33 +242,14 @@ function startMachine(romData: Uint8Array, appHostPath?: string): void {
   machine    = new ArchimedesMachine(config, logger);
   wimpHost   = new NativeWimpHost();
 
-  // obeyFs gives the ObeyInterpreter access to !Run / !Boot scripts on disk.
-  // fs is intentionally omitted: in ROM boot mode the real ROM FileSwitch
-  // handles OS_File / OS_Find / etc.; HostFsHandler (registered below)
-  // intercepts only HostFS:: paths and passes everything else through to ROM.
+  // obeyFs is used only for bootAllApps() pre-boot !Boot scripts.
+  // In ROM boot mode the real ROM CLI/FileSwitch handles all app launching.
   dispatcher = new SwiDispatcher(machine, wimpHost, {
     onOutput: (text) => {
       logger.debug(`[RISC OS] ${text}`);
       launcherWindow?.webContents.send("console-output", text);
     },
     obeyFs: nodeFs,
-    onRunBinary: (riscosPath) => {
-      logger.debug(`[onRunBinary] loading: ${riscosPath}`);
-      try {
-        const data = nodeFs.readFile(riscosPath);
-        logger.debug(`[onRunBinary] binary size: ${data.length} bytes — starting app`);
-        // SWI 0xADBEEF is the AIF "not yet decompressed" guard — halt cleanly.
-        machine!.cpu.swiHandlers.set(0xADBEEF, () => {
-          logger.debug(`[AIF] decompressor guard SWI — binary not decompressed correctly`);
-          machine!.cpu.halted = true;
-        });
-        machine!.startApp(data);
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        logger.error(`[onRunBinary] failed: ${msg}`);
-        launcherWindow?.webContents.send(IPC.ERROR, { message: `Cannot run ${riscosPath}: ${msg}`, fatal: false });
-      }
-    },
     onServiceStartFiler: () => {
       logger.debug(`[HostFS] Service_StartFiler received — adding iconbar disc icon`);
       wimpHost?.setIconbarEntry(HOSTFS_ICONBAR_HANDLE, "hostfsdisk", "HostFS::$");
@@ -345,7 +326,13 @@ function startMachine(romData: Uint8Array, appHostPath?: string): void {
   bootAllApps();
 
   if (appHostPath) {
-    launchApp(nodeFs, appHostPath);
+    // Defer launch until after the ROM has booted and the CPU is suspended in
+    // Wimp_Poll.  We reuse the same 3-second window as the iconbar fallback.
+    const appName = path.basename(path.resolve(appHostPath));
+    setTimeout(() => {
+      logger.debug(`[CLI] launching via ROM CLI: Run HostFS::$.${appName}.!Run`);
+      machine?.execCLI(`Run HostFS::$.${appName}.!Run`);
+    }, 3500);
   }
   // No specific app — just boot the ROM and wait for the Filer to start.
   // The Service_StartFiler callback (or the fallback timer) will add the icon.
@@ -354,57 +341,6 @@ function startMachine(romData: Uint8Array, appHostPath?: string): void {
   // (We keep it hidden rather than closed so the app process stays alive while
   // RISC OS boots and opens its own windows.)
   launcherWindow?.hide();
-}
-
-// ---------------------------------------------------------------------------
-// App launch (CLI)
-// ---------------------------------------------------------------------------
-function launchApp(nodeFs: NodeFsHost, hostPath: string): void {
-  const resolved = path.resolve(hostPath);
-
-  if (!fs.existsSync(resolved)) {
-    launcherWindow?.webContents.send(IPC.ERROR, {
-      message: `App path not found: ${hostPath}`,
-      fatal: false,
-    });
-    return;
-  }
-
-  const stat = fs.statSync(resolved);
-
-  if (stat.isDirectory()) {
-    const appName   = path.basename(resolved);          // e.g. "!Paint"
-
-    if (!appName.startsWith("!")) {
-      launcherWindow?.webContents.send(IPC.ERROR, {
-        message: `App directory name must start with '!': ${appName}`,
-        fatal: false,
-      });
-      return;
-    }
-
-    const runScript = `$.${appName}.!Run`;              // e.g. "$.!Paint.!Run"
-
-    if (nodeFs.stat(runScript) !== null) {
-      // Normal RISC OS app: run the !Run Obey script
-      dispatcher!.obey.runFile(runScript);
-    } else {
-      // No !Run — try !RunImage as a raw binary
-      const riscosRunImage = `$.${appName}.!RunImage`;
-      if (nodeFs.stat(riscosRunImage) !== null) {
-        machine!.loadProgram(nodeFs.readFile(riscosRunImage));
-      } else {
-        launcherWindow?.webContents.send(IPC.ERROR, {
-          message: `No !Run or !RunImage found in: ${hostPath}`,
-          fatal: false,
-        });
-      }
-    }
-  } else {
-    // Raw binary file — load it directly at 0x8000
-    const data = fs.readFileSync(resolved);
-    machine!.loadProgram(new Uint8Array(data));
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -480,34 +416,19 @@ ipcMain.handle(IPC.HOSTFS_LIST_DIR, (_ev, riscosPath: string): DirEntry[] => {
 
 ipcMain.handle(IPC.HOSTFS_LAUNCH, (_ev, riscosPath: string) => {
   logger.debug(`[hostfs:launch] ${riscosPath}`);
-  if (!dispatcher || !machine) {
+  if (!machine) {
     logger.error(`[hostfs:launch] machine not ready`);
     return;
   }
 
-  const programsDir = resolveAssets("assets", "programs");
-  const programsFs  = new NodeFsHost(programsDir);
+  // Ensure the path is fully qualified with the HostFS:: prefix so the ROM's
+  // FileSwitch can route it to our registered filing system.
+  const fullPath = riscosPath.startsWith("HostFS::") ? riscosPath : `HostFS::${riscosPath}`;
+  logger.debug(`[hostfs:launch] ROM CLI: Run ${fullPath}.!Run`);
 
-  // Resolve HostFS::$.!App → $.!App
-  let riscosRelPath = riscosPath;
-  if (riscosRelPath.startsWith("HostFS::$")) {
-    riscosRelPath = riscosRelPath.slice("HostFS::".length); // e.g. "$.!Paint"
-  }
-
-  const runScript = `${riscosRelPath}.!Run`;
-  if (programsFs.stat(runScript) !== null) {
-    logger.debug(`[hostfs:launch] running obey: ${runScript}`);
-    dispatcher.obey.runFile(runScript);
-  } else {
-    const runImage = `${riscosRelPath}.!RunImage`;
-    logger.debug(`[hostfs:launch] no !Run, trying binary: ${runImage}`);
-    if (programsFs.stat(runImage) !== null) {
-      const data = programsFs.readFile(runImage);
-      machine.startApp(data);
-    } else {
-      logger.error(`[hostfs:launch] no !Run or !RunImage found for ${riscosPath}`);
-    }
-  }
+  // Delegate entirely to the ROM's CLI handler — it knows how to interpret
+  // Obey scripts, handle *FX / *IfThere / *RMLoad etc., and load ARM binaries.
+  machine.execCLI(`Run ${fullPath}.!Run`);
 });
 
 ipcMain.handle(IPC.HOSTFS_OPEN_DIR, (_ev, riscosPath: string) => {
