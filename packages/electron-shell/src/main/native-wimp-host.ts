@@ -40,6 +40,9 @@ export class NativeWimpHost implements NativeHost {
   /** Map from RISC OS window handle → BrowserWindow */
   private windows = new Map<number, BrowserWindow>();
 
+  /** Last-known scroll position per window (OS units), for Open events */
+  private windowScroll = new Map<number, { scrollX: number; scrollY: number }>();
+
   /** Pending Wimp_Poll resolvers */
   private pollResolvers: Array<(ev: WimpPollEvent) => void> = [];
   /** Queued events that arrived before Wimp_Poll was called */
@@ -90,20 +93,33 @@ export class NativeWimpHost implements NativeHost {
       this.deliverEvent({ code: WimpEvent.Close, data: [handle, 0, 0, 0, 0, 0, 0, 0] });
     });
 
-    // Track window moves/resizes → update pointer/window state
-    win.on("moved", () => {
-      const [x, y] = win.getPosition();
-      const [w, h] = win.getSize();
-      const disp = screen.getPrimaryDisplay();
-      const H = disp.workAreaSize.height;
-      // Deliver open event so RISC OS knows the new position
+    // Shared helper: deliver Open_Window_Request + Redraw whenever the native
+    // window moves or resizes.  Uses getContentBounds() so the geometry covers
+    // only the drawable canvas area (excludes title bar / chrome).
+    const deliverGeometryChange = () => {
+      const { x, y, width, height } = win.getContentBounds();
+      const H    = screen.getPrimaryDisplay().workAreaSize.height;
+      const sx   = this.windowScroll.get(handle)?.scrollX ?? 0;
+      const sy   = this.windowScroll.get(handle)?.scrollY ?? 0;
+      // Convert content-area pixels → RISC OS OS units (×2), flip Y axis
+      const osX0 = x * 2;
+      const osY0 = (H - y - height) * 2;   // bottom edge
+      const osX1 = (x + width) * 2;
+      const osY1 = (H - y) * 2;            // top edge
       this.deliverEvent({
         code: WimpEvent.Open,
-        data: [handle, x * 2, (H - y - h) * 2, (x + w) * 2, (H - y) * 2, 0, 0, -1],
+        data: [handle, osX0, osY0, osX1, osY1, sx, sy, -1],
       });
-    });
+      // Queue a Redraw so the app repaints into the new dimensions
+      this.deliverEvent({ code: WimpEvent.Redraw, data: [handle] });
+    };
 
-    win.on("resize", () => win.webContents.send("wimp-resize"));
+    win.on("moved",  deliverGeometryChange);
+    win.on("resize", () => {
+      // Also resize the canvas to fill the new content area
+      win.webContents.send("wimp-resize");
+      deliverGeometryChange();
+    });
 
     this.windows.set(handle, win);
     return `win-${handle}`;
@@ -115,6 +131,8 @@ export class NativeWimpHost implements NativeHost {
   ): Promise<void> {
     const win = this.windows.get(handle);
     if (!win) return;
+    // Remember scroll so move/resize events can include it in Open events
+    this.windowScroll.set(handle, { scrollX: def.scrollX, scrollY: def.scrollY });
     const rect = osRect(def);
     win.setBounds(rect);
     win.show();
@@ -130,6 +148,7 @@ export class NativeWimpHost implements NativeHost {
     const win = this.windows.get(handle);
     if (win && !win.isDestroyed()) win.destroy();
     this.windows.delete(handle);
+    this.windowScroll.delete(handle);
   }
 
   async updateIcon(winHandle: number, iconHandle: number, icon: WimpIcon): Promise<void> {
