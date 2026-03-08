@@ -14,6 +14,7 @@ import { makeOSHandlers, type OutputCallback } from "./os-core.js";
 import { SystemVariables, type VarType } from "../sysvar/sysvar.js";
 import { ObeyInterpreter } from "../obey/obey.js";
 import { SpritePool } from "../sprite/sprite-pool.js";
+import { OSSpriteHandler } from "../sprite/os-sprite.js";
 import * as SWI from "../swi-numbers.js";
 
 export interface DispatcherOptions {
@@ -163,6 +164,11 @@ export class SwiDispatcher {
     cpu.swiHandlers.set(SWI.Wimp_ReportError,
       (r, b) => { void w.reportError(r, b); });
 
+    // ── Sprite operations ─────────────────────────────────────────────────────
+    const spriteHandler = new OSSpriteHandler(this.spritePool);
+    cpu.swiHandlers.set(SWI.OS_SpriteOp,  (r, b) => spriteHandler.handleOS(r, b));
+    cpu.swiHandlers.set(SWI.Wimp_SpriteOp,(r, b) => spriteHandler.handleWimp(r, b));
+
     // Stubs for less critical SWIs — acknowledge without doing anything
     const stub = () => {};
     for (const n of [
@@ -172,7 +178,7 @@ export class SwiDispatcher {
       SWI.Wimp_SetPointerShape, SWI.Wimp_OpenTemplate, SWI.Wimp_CloseTemplate,
       SWI.Wimp_LoadTemplate, SWI.Wimp_ProcessKey, SWI.Wimp_StartTask,
       SWI.Wimp_GetWindowOutline, SWI.Wimp_PlotIcon, SWI.Wimp_SetMode,
-      SWI.Wimp_SpriteOp, SWI.Wimp_CreateSubMenu, SWI.Wimp_SetFontColours,
+      SWI.Wimp_CreateSubMenu, SWI.Wimp_SetFontColours,
       SWI.Wimp_GetMenuState, SWI.Wimp_TextColour,
     ]) {
       cpu.swiHandlers.set(n, stub);

@@ -30,10 +30,12 @@
  */
 
 export interface SpriteData {
-  name:   string;
-  width:  number;              // pixels
-  height: number;              // pixels
-  rgba:   Uint8ClampedArray;   // width × height × 4 (RGBA, premultiplied alpha)
+  name:    string;
+  width:   number;              // pixels
+  height:  number;              // pixels
+  mode:    number;              // RISC OS screen mode number
+  hasMask: boolean;
+  rgba:    Uint8ClampedArray;   // width × height × 4 (RGBA)
 }
 
 export class SpritePool {
@@ -82,7 +84,7 @@ export class SpritePool {
         data, imageStart, maskStart, width, height, widthWords, lbit, bpp, palette,
       );
 
-      if (name) this.sprites.set(name.toLowerCase(), { name, width, height, rgba });
+      if (name) this.sprites.set(name.toLowerCase(), { name, width, height, mode, hasMask, rgba });
 
       off += nextOff;
     }
