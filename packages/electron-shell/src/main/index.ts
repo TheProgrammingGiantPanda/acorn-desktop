@@ -151,7 +151,7 @@ function createProgramsBrowserWindow(): BrowserWindow {
 
   if (isDev) {
     win.loadURL("http://localhost:5173/programs-browser.html");
-    win.webContents.openDevTools({ mode: "detach" });
+    win.webContents.once("did-finish-load", () => win.webContents.openDevTools({ mode: "detach" }));
   } else {
     win.loadFile(path.join(__dirname, "../../renderer/programs-browser.html"));
   }
