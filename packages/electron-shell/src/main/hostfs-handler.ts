@@ -64,11 +64,24 @@ function makeLoadExec(fileType: number, mtimeMs: number): { load: number; exec: 
 const UNTYPED_LOAD = 0xFFFFFFFF;
 const UNTYPED_EXEC = 0x00000000;
 
+/**
+ * Extract the 12-bit RISC OS file type from a typed load address
+ * (bits [23:20] = 0xF → typed file; bits [19:8] = type).
+ * Returns null for untyped load addresses.
+ */
+function extractFileType(loadAddr: number): number | null {
+  return ((loadAddr >>> 20) & 0xFFF) === 0xFFF
+    ? (loadAddr >>> 8) & 0xFFF
+    : null;
+}
+
 interface HandleEntry {
   type:       "file" | "dir";
   nativePath: string;
   offset:     number;
   size:       number;
+  /** Set for writable handles; accumulated in memory and flushed on close. */
+  writeBuf?:  number[];
 }
 
 export class HostFsHandler {
@@ -118,6 +131,29 @@ export class HostFsHandler {
 
   private statToType(stat: fs.Stats): 1 | 2 {
     return stat.isDirectory() ? 2 : 1;
+  }
+
+  /**
+   * Return the host path to write to for a given RISC OS leaf name + file type.
+   * Appends `,xyz` when fileType is known, and removes any existing file in the
+   * same directory that has the same base name with a *different* `,xyz` suffix
+   * (RISC OS re-typing a file should not leave an orphaned copy behind).
+   */
+  private saveNativePath(dir: string, riscosLeaf: string, fileType: number | null): string {
+    const suffix  = fileType !== null ? `,${fileType.toString(16).padStart(3, "0")}` : "";
+    const newName = riscosLeaf + suffix;
+
+    // Remove stale ,xyz copies with a different suffix
+    try {
+      for (const entry of fs.readdirSync(dir)) {
+        const { baseName } = parseTypeSuffix(entry);
+        if (baseName.toLowerCase() === riscosLeaf.toLowerCase() && entry !== newName) {
+          try { fs.unlinkSync(path.join(dir, entry)); } catch { /* ignore */ }
+        }
+      }
+    } catch { /* dir unreadable — ignore */ }
+
+    return path.join(dir, newName);
   }
 
   /**
@@ -181,6 +217,32 @@ export class HostFsHandler {
     regs.V = false;
 
     switch (reason) {
+      case 0: { // Save memory block to file
+        // R1=name, R2=load addr (may encode type), R3=exec addr, R4=start, R5=end
+        const loadAddr = regs.read(2) >>> 0;
+        const start    = regs.read(4) >>> 0;
+        const end      = regs.read(5) >>> 0;
+        const fileType = extractFileType(loadAddr);
+        const leaf     = path.basename(native);
+        const dir      = path.dirname(native);
+        const savePath = this.saveNativePath(dir, leaf, fileType);
+        const len      = end > start ? end - start : 0;
+        const data     = new Uint8Array(len);
+        for (let i = 0; i < len; i++) data[i] = bus.read8(start + i);
+        try {
+          fs.mkdirSync(dir, { recursive: true });
+          fs.writeFileSync(savePath, data);
+          regs.write(0, 1); // type = file
+          regs.write(2, loadAddr);
+          regs.write(3, regs.read(3)); // preserve exec addr
+          regs.write(4, len);
+          regs.write(5, ATTR_DEFAULT);
+        } catch {
+          regs.write(0, 0);
+        }
+        break;
+      }
+
       case 5: { // Read catalogue info
         try {
           const stat = fs.statSync(native);
@@ -249,10 +311,13 @@ export class HostFsHandler {
       // Close: R1 = handle (0 = close all HostFS handles)
       const handle = regs.read(1);
       if (handle === 0) {
+        for (const entry of this.handles.values()) this.flushHandle(entry);
         this.handles.clear();
         return "passthrough"; // also let ROM close its own handles
       }
       if (this.handles.has(handle)) {
+        const entry = this.handles.get(handle)!;
+        this.flushHandle(entry);
         this.handles.delete(handle);
         return; // handled — don't touch ROM
       }
@@ -260,24 +325,43 @@ export class HostFsHandler {
     }
 
     // Open: R0 bits[7:4]=mode (0x40=read, 0x80=write, 0xC0=update), R1=path
+    const mode     = reason & 0xF0;
     const pathAddr = regs.read(1) >>> 0;
     const riscPath = this.readString(bus, pathAddr);
     const native   = this.toNativeResolved(riscPath);
     if (native === null) return "passthrough";
 
     try {
-      const stat = fs.statSync(native);
-      const h    = this.allocHandle();
+      const writable = mode === 0x80 || mode === 0xC0;
+      let existingData: number[] = [];
+      let size = 0;
+      try {
+        const buf  = fs.readFileSync(native);
+        existingData = Array.from(buf);
+        size = buf.length;
+      } catch {
+        // New file — start empty (write mode)
+        if (!writable) { regs.write(0, 0); return; }
+      }
+      const h = this.allocHandle();
       this.handles.set(h, {
-        type:       this.statToType(stat) === 2 ? "dir" : "file",
+        type:      "file",
         nativePath: native,
-        offset:     0,
-        size:       stat.isFile() ? stat.size : 0,
+        offset:    0,
+        size,
+        writeBuf:  writable ? existingData : undefined,
       });
       regs.write(0, h);
     } catch {
       regs.write(0, 0); // file not found
     }
+  }
+
+  /** Flush a writable handle's write buffer to disk. */
+  private flushHandle(entry: HandleEntry): void {
+    if (!entry.writeBuf) return;
+    try { fs.writeFileSync(entry.nativePath, Buffer.from(entry.writeBuf)); }
+    catch { /* best-effort */ }
   }
 
   // ---------------------------------------------------------------------------
@@ -295,7 +379,7 @@ export class HostFsHandler {
       case 0: regs.write(2, entry.offset); break;             // read ptr
       case 1: entry.offset = regs.read(2) >>> 0; break;       // set ptr
       case 2: regs.write(2, entry.size);   break;             // read extent
-      case 255: /* flush — no-op for read-only */ break;
+      case 255: this.flushHandle(entry); break;
       default: regs.write(2, 0); break;
     }
   }
@@ -373,6 +457,31 @@ export class HostFsHandler {
 
       regs.write(3, written);
       regs.write(4, idx >= allEntries.length ? 0xFFFFFFFF : idx);
+      return;
+    }
+
+    // ── Sequential file write (reasons 1, 2) ─────────────────────────────────
+    if (reason === 1 || reason === 2) {
+      const handle  = regs.read(1);
+      const bufAddr = regs.read(2) >>> 0;
+      const count   = regs.read(3) >>> 0;
+      const entry   = this.handles.get(handle);
+      if (!entry || !entry.writeBuf) return "passthrough";
+
+      const writeAt = reason === 1 ? regs.read(4) >>> 0 : entry.offset;
+
+      // Extend the write buffer if needed
+      const needed = writeAt + count;
+      while (entry.writeBuf.length < needed) entry.writeBuf.push(0);
+      for (let i = 0; i < count; i++) {
+        entry.writeBuf[writeAt + i] = bus.read8(bufAddr + i);
+      }
+      entry.offset = writeAt + count;
+      entry.size   = Math.max(entry.size, entry.offset);
+
+      regs.write(2, bufAddr + count);
+      regs.write(3, 0); // zero bytes remaining
+      if (reason === 1) regs.write(4, entry.offset);
       return;
     }
 

@@ -1,16 +1,14 @@
 # Acorn Desktop
 
-An Acorn Archimedes emulator that runs RISC OS programs on Windows, Linux, and macOS.
+An Acorn Archimedes emulator that boots real RISC OS ROM images on Windows, Linux, and macOS.
 
-Instead of emulating the hardware display (VIDC frame buffer), it intercepts RISC OS Wimp SWI calls and maps each RISC OS window to a real native OS window via Electron. The result is a RISC OS application environment that looks and feels like a native desktop app.
+The real RISC OS ROM executes from address 0 just as it would on hardware. Wimp SWI calls are intercepted and each RISC OS window is mapped to a real native OS window via Electron, so the desktop looks and feels native. Host directories are accessible to RISC OS programs via the built-in HostFS filing system.
 
 ## How it works
 
-The ARM2/ARM3 CPU executes RISC OS machine code. When the program calls a Wimp SWI (e.g. `Wimp_CreateWindow`), the emulator intercepts it and creates a real `BrowserWindow` instead of writing pixels to a frame buffer. File I/O SWIs are forwarded to the host file system. Mouse clicks, key presses, and window events flow back into the emulated CPU via the `Wimp_Poll` event queue.
-
 ```
-ARM program code
-      │
+RISC OS ROM
+      │ boots, initialises modules, starts Filer
       ▼
   ARM2 CPU (arm2.ts)
       │ SWI instruction
@@ -26,15 +24,17 @@ ARM program code
       │                                                         ▼
       │                                               Electron BrowserWindow (per RISC OS window)
       │
-      └─ OS_File / OS_Find / OS_BGet / OS_GBPB … ──────────────────┐
+      ├─ OS_File / OS_Find / OS_GBPB / OS_Args  ────────────────────┐
+      │   (path starts with "HostFS::")                             ▼
+      │                                                  HostFsHandler (hostfs-handler.ts)
+      │                                                       │ Node.js fs
+      │                                                       ▼
+      │                                               Host file system (configurable root)
+      │
+      └─ all other SWIs ────────────────────────────────────────────┐
                                                                     ▼
-                                                          OSFileHandler (os-fs.ts)
-                                                              │ FileSystemHost interface
-                                                              ▼
-                                                         NodeFsHost (node-fs-host.ts)
-                                                              │
-                                                              ▼
-                                                       Host file system (~/Documents/RISCOS)
+                                                          ROM FileSwitch / OS kernel
+                                                          (ADFS, RAM disc, modules…)
 ```
 
 ## Packages
@@ -50,6 +50,7 @@ ARM program code
 
 - Node.js 18+
 - pnpm 8+
+- A RISC OS ROM image (see [ROM images](#rom-images))
 
 ```sh
 npm install -g pnpm
@@ -63,7 +64,7 @@ pnpm build
 pnpm start
 ```
 
-Then click **Load ROM** and select a RISC OS ROM image (`.rom`, `.bin`, or `.img`). You can also drag a ROM file onto the launcher window.
+Place a RISC OS ROM image (`.rom`, `.bin`, or `.img`) in `assets/roms/`. The emulator loads it automatically on startup. You can also click **Load ROM** in the menu or drag a ROM file onto the launcher window.
 
 ## Development
 
@@ -71,7 +72,7 @@ Then click **Load ROM** and select a RISC OS ROM image (`.rom`, `.bin`, or `.img
 pnpm dev
 ```
 
-This starts the Electron app in dev mode with hot-reload for the renderer and watch mode for the main process TypeScript.
+Starts the Electron app in dev mode with hot-reload for the renderer and watch mode for the main process TypeScript.
 
 ### Build order
 
@@ -107,7 +108,7 @@ The CPU is a full ARMv2 implementation:
 - Single and block data transfer (LDR/STR, LDM/STM — all four IA/IB/DA/DB addressing modes)
 - Branch and branch-with-link
 - Multiply and multiply-accumulate
-- SWI dispatch with registered handlers
+- SWI dispatch: registered handlers are checked first; returning `'passthrough'` falls through to the ROM SWI vector
 - Exception vectors (Reset, Undefined, SWI, Prefetch Abort, Data Abort, IRQ, FIQ)
 - ARM2 R15 encodes both PC and PSR (flags, mode, IRQ/FIQ mask bits)
 
@@ -116,7 +117,7 @@ ARM3 support adds a coprocessor CP15 cache-flush stub but is otherwise instructi
 ### Memory map
 
 ```
-0x0000_0000 – 0x01FF_FFFF   Logical RAM (via MEMC)
+0x0000_0000 – 0x01FF_FFFF   Logical RAM (via MEMC CAM)
 0x0200_0000 – 0x03FF_FFFF   Physical RAM (up to 4 MB)
 0x3200_0000 – 0x323F_FFFF   IOC (I/O controller)
 0x3400_0000 – 0x37FF_FFFF   ROM (4 MB window)
@@ -124,7 +125,20 @@ ARM3 support adds a coprocessor CP15 cache-flush stub but is otherwise instructi
 0x36E0_0000 – 0x36FF_FFFF   MEMC control registers
 ```
 
-ROM is also aliased at address 0 until MEMC releases it (standard Archimedes reset behaviour).
+ROM is aliased at address 0 on reset. The ROM releases the alias itself by writing the MEMC control register during its boot sequence.
+
+### Boot sequence
+
+The real RISC OS ROM boots from address 0:
+
+1. ROM initialises MEMC, IOC, and writes its own exception vectors into RAM
+2. ROM releases the ROM alias by writing the MEMC control register
+3. ROM initialises the module system (FileSwitch, ADFS, RAM disc, Filer, etc.)
+4. The Wimp starts and the desktop appears
+
+A 50 Hz vertical-blank IRQ is generated unconditionally (without VIDC rendering) so the ROM's cooperative task switcher fires correctly.
+
+Before the ROM boots, `assets/programs/` is scanned for RISC OS `!App` directories. Each app's `!Boot` Obey script is executed (or its `!Sprites` loaded directly) to register file type associations and load app sprites into the system sprite pool.
 
 ### Native window mode
 
@@ -136,22 +150,50 @@ No VIDC pixel rendering takes place. Instead:
 - Mouse clicks and key presses in a `BrowserWindow` are sent via IPC to the main process and delivered to the emulated CPU as Wimp events
 - The iconbar is a persistent, frameless, always-on-bottom `BrowserWindow`
 
-### Boot sequence
+### HostFS
 
-On startup, the emulator scans `assets/programs/` for RISC OS application directories (names beginning with `!`) and boots them in alphabetical order, mirroring the behaviour of the RISC OS Filer when it first opens a directory:
+HostFS exposes a host directory to RISC OS programs using the path prefix `HostFS::`.
 
-1. If the app has a `!Boot` Obey script, it is executed. This sets system variables (e.g. `AppName$Dir`, `AppName$Path`), registers file type associations, and loads the app's sprites.
-2. If the app has no `!Boot` but has a `!Sprites` file, the sprites are loaded directly.
+**Path format:**
 
-Variables set during boot (e.g. `File$Type_FCA`) remain live for the duration of the session and are visible to any subsequently launched application.
+| RISC OS path | Host path |
+|---|---|
+| `HostFS::$` | `{root}` |
+| `HostFS::$.Programs.!Paint` | `{root}/Programs/!Paint` |
+
+The root directory defaults to the directory from which the app or ROM was launched (typically `assets/programs/`).
+
+**File type preservation — `,xyz` suffix convention:**
+
+RISC OS files carry a 12-bit file type encoded in the load address. On a native filesystem these are preserved using the standard `,xyz` filename suffix (three lowercase hex digits):
+
+| Host filename | RISC OS name | File type |
+|---|---|---|
+| `Document,fff` | `Document` | 0xFFF (untyped) |
+| `Letter,ffc` | `Letter` | 0xFFC (Text) |
+| `Sprite,ff9` | `Sprite` | 0xFF9 (Sprite) |
+
+When reading, the `,xyz` suffix is stripped and the file type is encoded into the RISC OS load/exec address words (including a RISC OS 5-byte centisecond timestamp derived from the host file's mtime). When writing, the correct `,xyz` suffix is appended and any stale copy with a different suffix is removed.
+
+Files without a `,xyz` suffix are presented as untyped (`load=0xFFFFFFFF`).
+
+**SWI coverage:**
+
+| SWI | Reason codes | Notes |
+|---|---|---|
+| `OS_File` | 0 (save block), 5 (stat), 8 (mkdir), 255 (load) | Save appends `,xyz` from load addr |
+| `OS_Find` | 0x40 read, 0x80 write, 0xC0 update, 0x00 close | Writes buffered in memory, flushed on close |
+| `OS_Args` | 0 get ptr, 1 set ptr, 2 get extent, 255 flush | |
+| `OS_GBPB` | 1–2 write, 3–4 read, 9/10/11/12 dir listing | Dir listing returns bare names + full catalogue info |
+| `OS_FSControl` | 0 select, 36 canonicalise | |
+
+All other paths (not beginning with `HostFS::`) return `'passthrough'` and are handled by the real ROM FileSwitch (ADFS, RAM disc, etc.).
 
 ### Sprites
 
 RISC OS sprite files (`.!Sprites`) are parsed and decoded at boot time by `SpritePool` in `packages/risc-os/src/sprite/sprite-pool.ts`.
 
 **File format:**
-
-Sprite files omit the first "area size" word that is present in memory-resident sprite areas. All stored offsets are therefore 4 bytes larger than their file-relative positions.
 
 | Region | Layout |
 |---|---|
@@ -165,49 +207,17 @@ Colour words use the format: bits 8–15 = red, 16–23 = green, 24–31 = blue.
 
 Default palettes are provided for 1, 2, 4, and 8 bpp modes. An embedded palette in the sprite overrides the default.
 
-**Path-variable resolution:**
-
-The Obey `IconSprites` command supports the RISC OS path-variable syntax (`AppName:filename`). `AppName:` is expanded to the value of the `AppName$Path` system variable before the file is read.
-
-### File system
-
-File I/O SWIs are forwarded to the host OS via a `FileSystemHost` interface. The default implementation (`NodeFsHost`) uses synchronous Node.js `fs` APIs, mirroring the blocking behaviour of real Archimedes hardware.
-
-The RISC OS filing system root (`$`) maps to `~/Documents/RISCOS` on the host. The directory is created automatically on first launch.
-
-**Path translation:**
-
-| RISC OS | Host equivalent |
-|---|---|
-| `$` | `~/Documents/RISCOS` |
-| `$.Apps.Paint` | `~/Documents/RISCOS/Apps/Paint` |
-| `@` | current selected directory |
-| `^` | parent directory (`..`) |
-| `:Volume.$` | volume prefix stripped, treated as `$` |
-
-**File system SWI coverage:**
-
-| SWI | Reason codes implemented |
-|---|---|
-| `OS_File` | 0 (save block), 5 (stat), 6 (delete), 7 (create), 255 (load) |
-| `OS_Find` | 0x40 read, 0x80 write, 0xC0 read/write, 0x00 close |
-| `OS_Args` | 0 get ptr, 1 set ptr, 2 get extent, 3 set extent, 255 flush |
-| `OS_BGet` | read byte, C=1 on EOF |
-| `OS_BPut` | write byte |
-| `OS_GBPB` | 1–4 block read/write, 8 directory listing |
-| `OS_FSControl` | 26 set CSD, 36 canonicalise path |
-
 ### Supported SWIs
 
 **OS core:** `OS_WriteC`, `OS_Write0`, `OS_WriteN`, `OS_NewLine`, `OS_Exit`, `OS_GetEnv`, `OS_Byte`, `OS_Mouse`, `OS_ReadModeVar`, `OS_Heap`, `OS_Module`, `OS_IntOn`, `OS_IntOff`
 
-**File system:** `OS_File`, `OS_Find`, `OS_Args`, `OS_BGet`, `OS_BPut`, `OS_GBPB`, `OS_FSControl`
+**HostFS:** `OS_File`, `OS_Find`, `OS_Args`, `OS_GBPB`, `OS_FSControl` (for `HostFS::` paths only; all other paths pass through to ROM)
 
 **Wimp:** `Wimp_Initialise`, `Wimp_CreateWindow`, `Wimp_OpenWindow`, `Wimp_CloseWindow`, `Wimp_DeleteWindow`, `Wimp_Poll`, `Wimp_PollIdle`, `Wimp_RedrawWindow`, `Wimp_UpdateWindow`, `Wimp_GetWindowState`, `Wimp_ForceRedraw`, `Wimp_CreateIcon`, `Wimp_CreateMenu`, `Wimp_ReportError`, `Wimp_GetPointerInfo`, `Wimp_SlotSize`, `Wimp_ReadSysInfo`, `Wimp_SendMessage`, `Wimp_CloseDown`
 
 **Font:** `Font_FindFont`, `Font_LoseFont`, `Font_Paint`, `Font_StringWidth`, `Font_SetFontColours` (stubs)
 
-Unhandled SWIs vector to the ROM exception handler in the normal ARMv2 way.
+All other SWIs are handled by the ROM.
 
 ## Project structure
 
@@ -220,23 +230,23 @@ acorn-desktop/
 │   ├── arm-emulator/
 │   │   └── src/
 │   │       ├── cpu/
-│   │       │   ├── arm2.ts       # CPU core
+│   │       │   ├── arm2.ts       # CPU core + SWI passthrough mechanism
 │   │       │   └── registers.ts  # Register file (R0–R15, PSR)
 │   │       ├── memory/
 │   │       │   └── bus.ts        # System bus / address decode
 │   │       ├── chips/
-│   │       │   ├── memc.ts       # Memory controller
-│   │       │   ├── ioc.ts        # I/O controller
+│   │       │   ├── memc.ts       # Memory controller (CAM, ROM alias release)
+│   │       │   ├── ioc.ts        # I/O controller (timers, IRQ/FIQ, VBL)
 │   │       │   └── vidc.ts       # Video controller (stub)
-│   │       └── machine.ts        # Top-level machine wiring
+│   │       └── machine.ts        # Top-level machine wiring + bootROM()
 │   ├── risc-os/
 │   │   └── src/
 │   │       ├── swi/
-│   │       │   ├── dispatcher.ts # Registers all SWI handlers
+│   │       │   ├── dispatcher.ts # Registers Wimp + OS SWI handlers
 │   │       │   └── os-core.ts    # OS_* SWI implementations
 │   │       ├── fs/
 │   │       │   ├── fs-host.ts    # FileSystemHost interface
-│   │       │   └── os-fs.ts      # OS_File / OS_Find / OS_Args / OS_BGet / OS_BPut / OS_GBPB / OS_FSControl
+│   │       │   └── os-fs.ts      # HLE file SWI handlers (used in non-ROM mode)
 │   │       ├── wimp/
 │   │       │   ├── wimp-manager.ts  # Wimp_* SWI implementations
 │   │       │   ├── event-queue.ts   # Wimp event queue
@@ -248,9 +258,10 @@ acorn-desktop/
 │   └── electron-shell/
 │       └── src/
 │           ├── main/
-│           │   ├── index.ts            # Electron main process
+│           │   ├── index.ts            # Electron main process + boot sequence
 │           │   ├── native-wimp-host.ts # NativeHost → BrowserWindow
-│           │   ├── node-fs-host.ts     # FileSystemHost → host OS (~/Documents/RISCOS)
+│           │   ├── hostfs-handler.ts   # HostFS SWI handler (HostFS:: paths)
+│           │   ├── node-fs-host.ts     # FileSystemHost → host OS
 │           │   └── menu.ts             # Application menu
 │           ├── preload/
 │           │   ├── index.ts           # Launcher preload
@@ -266,12 +277,13 @@ acorn-desktop/
 
 ## ROM images
 
-You need a RISC OS ROM image to run anything. ROM images are copyrighted by RISC OS Open Ltd and are not included here. A legitimate copy can be obtained from [riscosopen.org](https://riscosopen.org).
+You need a RISC OS ROM image to run the emulator. ROM images are copyrighted by RISC OS Open Ltd and are not included here. A legitimate copy can be obtained from [riscosopen.org](https://riscosopen.org).
+
+Place the ROM image in `assets/roms/` with a `.rom`, `.bin`, or `.img` extension. The first file found is loaded automatically.
 
 ## Limitations
 
 - No VIDC pixel rendering — applications that draw directly to the frame buffer rather than using Wimp SWIs will not display correctly
 - No sound
-- Single-tasking (one ARM program at a time)
 - No floating-point emulation (FPE)
-- File system covers core I/O but not all `OS_FSControl` operations, `OS_Var`, or the FileSwitch module API
+- HostFS is read/write but does not implement all `OS_FSControl` operations or the full FileSwitch module registration API
