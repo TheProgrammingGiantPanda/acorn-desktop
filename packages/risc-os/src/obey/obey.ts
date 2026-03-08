@@ -100,8 +100,13 @@ export class ObeyInterpreter {
       case 'ECHO':        this.output(rest.trim() + '\r\n'); break;
       case 'ICONSPRITES': this.cmdIconSprites(rest.trim()); break;
       default:
-        // Bare path or unrecognised command: treat as Run
-        this.cmdRun(line);
+        // '/path' is RISC OS shorthand for 'Run path'
+        if (line.startsWith('/')) {
+          this.cmdRun(line.slice(1).trim());
+        } else {
+          // Bare path or unrecognised command: treat as Run
+          this.cmdRun(line);
+        }
         break;
     }
   }
