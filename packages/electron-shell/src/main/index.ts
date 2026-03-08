@@ -12,6 +12,7 @@ import { ArchimedesMachine } from "@theprogramminggiantpanda/arm-emulator";
 import { SwiDispatcher, ObeyInterpreter, SpritePool } from "@theprogramminggiantpanda/risc-os";
 import { NativeWimpHost } from "./native-wimp-host.js";
 import { NodeFsHost } from "./node-fs-host.js";
+import { HostFsHandler } from "./hostfs-handler.js";
 import { buildAppMenu } from "./menu.js";
 import type { MachineConfig, AppEntry } from "@theprogramminggiantpanda/shared";
 import { IPC, Logger } from "@theprogramminggiantpanda/shared";
@@ -215,12 +216,13 @@ function startMachine(romData: Uint8Array, appHostPath?: string): void {
 
   machine    = new ArchimedesMachine(config, logger);
   wimpHost   = new NativeWimpHost();
+  // In ROM boot mode the real OS handles all non-HostFS file SWIs; we skip
+  // the HLE `fs` option so the dispatcher does not register competing handlers.
   dispatcher = new SwiDispatcher(machine, wimpHost, {
     onOutput: (text) => {
       logger.debug(`[RISC OS] ${text}`);
       launcherWindow?.webContents.send("console-output", text);
     },
-    fs: nodeFs,
     onRunBinary: (riscosPath) => {
       logger.debug(`[onRunBinary] loading: ${riscosPath}`);
       try {
@@ -239,6 +241,11 @@ function startMachine(romData: Uint8Array, appHostPath?: string): void {
       }
     },
   });
+
+  // Register HostFS: intercepts OS_File/OS_Find/OS_GBPB/OS_Args for "HostFS::"
+  // paths, passes everything else through to the real ROM FileSwitch.
+  const hostfs = new HostFsHandler(fsRoot);
+  hostfs.register(machine);
 
   machine.loadROM(romData);
   machine.bootROM();
