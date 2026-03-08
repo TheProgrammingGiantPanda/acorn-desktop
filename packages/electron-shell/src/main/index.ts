@@ -9,7 +9,7 @@ import { app, BrowserWindow, ipcMain, Menu, dialog } from "electron";
 import path from "path";
 import fs from "fs";
 import { ArchimedesMachine } from "@theprogramminggiantpanda/arm-emulator";
-import { SwiDispatcher } from "@theprogramminggiantpanda/risc-os";
+import { SwiDispatcher, ObeyInterpreter } from "@theprogramminggiantpanda/risc-os";
 import { NativeWimpHost } from "./native-wimp-host.js";
 import { NodeFsHost } from "./node-fs-host.js";
 import { buildAppMenu } from "./menu.js";
@@ -69,6 +69,55 @@ function createLauncherWindow(): BrowserWindow {
 let launcherWindow: BrowserWindow | null = null;
 
 // ---------------------------------------------------------------------------
+// Boot sequence: run !Boot for every app in assets/programs/
+// ---------------------------------------------------------------------------
+function bootAllApps(): void {
+  if (!dispatcher) return;
+
+  const programsDir = path.join(app.getAppPath(), "assets", "programs");
+  let entries: string[];
+  try {
+    entries = fs.readdirSync(programsDir);
+  } catch {
+    return; // no programs directory — silently skip
+  }
+
+  const appDirs = entries
+    .filter(name => name.startsWith("!"))
+    .filter(name => {
+      try { return fs.statSync(path.join(programsDir, name)).isDirectory(); }
+      catch { return false; }
+    })
+    .sort();
+
+  if (appDirs.length === 0) return;
+
+  const programsFs = new NodeFsHost(programsDir);
+  const onOutput = (text: string) => launcherWindow?.webContents.send("console-output", text);
+
+  for (const appName of appDirs) {
+    const bootPath   = `$.${appName}.!Boot`;
+    const spritePath = `$.${appName}.!Sprites`;
+
+    if (programsFs.stat(bootPath) !== null) {
+      const obey = new ObeyInterpreter(programsFs, dispatcher.sysvar, {
+        onOutput,
+        spritePool: dispatcher.spriteAreas.system,
+        // onRunBinary intentionally omitted: !Boot scripts almost never run
+        // ARM binaries directly, and there is no machine context to load into
+        // at this point in the boot sequence.
+      });
+      obey.runFile(bootPath);
+    } else if (programsFs.stat(spritePath) !== null) {
+      // No !Boot but has !Sprites — load sprites directly into the system area
+      try {
+        dispatcher.spriteAreas.system.loadArea(programsFs.readFile(spritePath));
+      } catch { /* ignore unreadable sprite files */ }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Machine lifecycle
 // ---------------------------------------------------------------------------
 function startMachine(romData: Uint8Array, appHostPath?: string): void {
@@ -101,6 +150,8 @@ function startMachine(romData: Uint8Array, appHostPath?: string): void {
 
   machine.loadROM(romData);
   machine.start();
+
+  bootAllApps();
 
   if (appHostPath) {
     launchApp(nodeFs, appHostPath);

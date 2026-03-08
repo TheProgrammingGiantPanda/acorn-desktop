@@ -29,6 +29,7 @@ export const OS_SetVarVal    = 0x000024;
 export const OS_Heap         = 0x00001D;
 export const OS_Module       = 0x00001E;
 export const OS_Mouse        = 0x0000033;
+export const OS_SpriteOp     = 0x00002E;
 export const OS_Plot         = 0x000045;
 export const OS_WriteN       = 0x000046;
 export const OS_AddToVector  = 0x000047;

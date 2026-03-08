@@ -13,30 +13,35 @@
  *   If <cond> Then <c> [Else <c>] — conditional
  *   Error [<n>] <msg>          — report error
  *   Echo <text>                — print text
- *   IconSprites <path>         — load app sprites (stub)
+ *   IconSprites <path>         — load app sprites into the sprite pool
  *   | <comment>                — ignored
  */
 
 import type { FileSystemHost } from '../fs/fs-host.js';
 import type { SystemVariables } from '../sysvar/sysvar.js';
+import type { SpritePool } from '../sprite/sprite-pool.js';
 
 export interface ObeyOptions {
   onOutput?:    (text: string) => void;
   /** Called when Run targets an ARM binary (not an Obey file). */
   onRunBinary?: (riscosPath: string) => void;
+  /** Sprite pool to load sprites into when IconSprites is executed. */
+  spritePool?:  SpritePool;
 }
 
 export class ObeyInterpreter {
   private readonly output:    (text: string) => void;
   private readonly runBinary: (path: string) => void;
+  private readonly spritePool: SpritePool | undefined;
 
   constructor(
     private readonly fs:     FileSystemHost | undefined,
     private readonly sysvar: SystemVariables,
     options: ObeyOptions = {},
   ) {
-    this.output    = options.onOutput    ?? (() => {});
-    this.runBinary = options.onRunBinary ?? (() => {});
+    this.output     = options.onOutput    ?? (() => {});
+    this.runBinary  = options.onRunBinary ?? (() => {});
+    this.spritePool = options.spritePool;
   }
 
   // ── Public API ─────────────────────────────────────────────────────────────
@@ -88,7 +93,7 @@ export class ObeyInterpreter {
       case 'IF':          this.cmdIf(rest); break;
       case 'ERROR':       this.cmdError(rest.trim()); break;
       case 'ECHO':        this.output(rest.trim() + '\r\n'); break;
-      case 'ICONSPRITES': /* stub — sprites rendered later */ break;
+      case 'ICONSPRITES': this.cmdIconSprites(rest.trim()); break;
       default:
         // Bare path or unrecognised command: treat as Run
         this.cmdRun(line);
@@ -121,6 +126,34 @@ export class ObeyInterpreter {
     } else {
       this.runBinary(path);
     }
+  }
+
+  private cmdIconSprites(rawPath: string): void {
+    if (!this.spritePool || !this.fs) return;
+    const riscosPath = this.resolvePathVar(rawPath);
+    let data: Uint8Array;
+    try {
+      data = this.fs.readFile(riscosPath);
+    } catch {
+      // Sprite file missing — silently skip (e.g. !Sprites22 on wrong hardware)
+      return;
+    }
+    this.spritePool.loadArea(data);
+  }
+
+  /**
+   * Resolve RISC OS path-variable syntax: "AppName:rest" → value of AppName$Path + rest.
+   * This is distinct from <VarName> substitution (handled by sysvar.substitute earlier).
+   */
+  private resolvePathVar(rawPath: string): string {
+    const colon = rawPath.indexOf(':');
+    if (colon > 0) {
+      const appName = rawPath.slice(0, colon);
+      const rest    = rawPath.slice(colon + 1);
+      const pathVar = this.sysvar.get(`${appName}$Path`);
+      if (pathVar !== undefined) return pathVar + rest;
+    }
+    return rawPath;
   }
 
   private cmdRMLoad(path: string): void {

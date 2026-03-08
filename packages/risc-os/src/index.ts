@@ -1,5 +1,7 @@
 export { SwiDispatcher } from "./swi/dispatcher.js";
 export type { DispatcherOptions } from "./swi/dispatcher.js";
+export { SpritePool, SpriteAreaRegistry } from "./sprite/sprite-pool.js";
+export type { SpriteData, SpriteBus } from "./sprite/sprite-pool.js";
 export { SystemVariables } from "./sysvar/sysvar.js";
 export type { VarType } from "./sysvar/sysvar.js";
 export { ObeyInterpreter } from "./obey/obey.js";
