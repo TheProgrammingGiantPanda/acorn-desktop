@@ -406,6 +406,15 @@ export class SpriteAreaRegistry {
   forOS(r0: number, r1: number, bus: SpriteBus): SpritePool {
     return (r0 & 0x100) ? this.getUserPool(r1, bus) : this.system;
   }
+
+  /**
+   * Invalidate the cached pool for a user area so the next call to
+   * getUserPool() re-parses from ARM memory.  Call this after ROM has
+   * modified the area (e.g. after a passthrough OS_SpriteOp returns).
+   */
+  invalidateUser(ptr: number): void {
+    this.userCache.delete(ptr);
+  }
 }
 
 // ── ARM memory helpers ────────────────────────────────────────────────────────

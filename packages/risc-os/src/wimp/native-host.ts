@@ -6,6 +6,9 @@
  */
 
 import type { WimpWindowDef, WimpIcon, WimpPollEvent } from "./types.js";
+import type { SpriteData } from "../sprite/sprite-pool.js";
+
+export type { SpriteData };
 
 export interface DrawCommand {
   /**
@@ -71,8 +74,9 @@ export interface NativeHost {
    */
   pollEvent(mask: number): Promise<WimpPollEvent>;
 
-  /** Update the taskbar / iconbar entry for this task */
-  setIconbarEntry(taskHandle: number, sprite: string, text: string): void;
+  /** Update the taskbar / iconbar entry for this task.
+   *  spriteData carries decoded RGBA pixels when the sprite was found in the pool. */
+  setIconbarEntry(handle: number, sprite: string, text: string, spriteData?: SpriteData): void;
 
   /** Remove the iconbar entry */
   removeIconbarEntry(taskHandle: number): void;

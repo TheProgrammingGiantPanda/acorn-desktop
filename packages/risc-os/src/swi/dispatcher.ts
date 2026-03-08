@@ -57,6 +57,7 @@ export class SwiDispatcher {
     this.wimp.setMachine(machine);
     this.sysvar      = new SystemVariables();
     this.spriteAreas = new SpriteAreaRegistry();
+    this.wimp.setSpritePool(this.spriteAreas.system);
     this.modules     = new ModuleRegistry();
     this.obey        = new ObeyInterpreter(options.obeyFs ?? options.fs, this.sysvar, {
       onOutput:    options.onOutput,
@@ -193,8 +194,30 @@ export class SwiDispatcher {
 
     // ── Sprite operations ─────────────────────────────────────────────────────
     const spriteHandler = new OSSpriteHandler(this.spriteAreas, fs);
-    cpu.swiHandlers.set(SWI.OS_SpriteOp,  (r, b) => spriteHandler.handleOS(r, b));
-    cpu.swiHandlers.set(SWI.Wimp_SpriteOp,(r, b) => spriteHandler.handleWimp(r, b));
+
+    cpu.swiHandlers.set(SWI.OS_SpriteOp, (regs, bus) => {
+      // Save the area selector and pointer before any register modification
+      const r0 = regs.read(0);
+      const r1 = regs.read(1);  // sprite area ptr (user areas only)
+      const isUserArea = !!(r0 & 0x100);
+
+      // HLE: handle locally (file loads, info queries).
+      // This runs regardless of ROM availability.
+      spriteHandler.handleOS(regs, bus);
+
+      // Passthrough: let ROM also run so its internal state stays in sync.
+      // afterReturn: invalidate the user-area cache so the next getUserPool()
+      // call re-parses any changes ROM may have written into ARM memory.
+      return {
+        passthrough: true,
+        afterReturn: (_r, b) => {
+          if (isUserArea) this.spriteAreas.invalidateUser(r1);
+          void b; // bus available if needed for future system-area sync
+        },
+      };
+    });
+
+    cpu.swiHandlers.set(SWI.Wimp_SpriteOp, (r, b) => spriteHandler.handleWimp(r, b));
 
     // All remaining Wimp_* SWIs passthrough to ROM.
     // The ROM's Wimp handles GetWindowInfo, SetIconState, ProcessKey, SetExtent,

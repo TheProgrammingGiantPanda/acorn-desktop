@@ -15,6 +15,7 @@ import {
   osUnitsToPx, pxToOsUnits,
 } from "./types.js";
 import type { ArchimedesMachine } from "@theprogramminggiantpanda/arm-emulator";
+import type { SpritePool, SpriteData } from "../sprite/sprite-pool.js";
 
 /** Read a null-terminated string from ARM RAM */
 function readString(bus: SystemBus, addr: number, maxLen = 256): string {
@@ -128,10 +129,13 @@ export class WimpManager {
   private fgColour = "#000000";
   /** Batch of draw commands accumulated during one redraw cycle */
   private pendingCmds: import("./native-host.js").DrawCommand[] = [];
+  /** Sprite pool for looking up iconbar sprite pixel data */
+  private spritePool: SpritePool | null = null;
 
   constructor(private readonly host: NativeHost) {}
 
   setMachine(m: ArchimedesMachine): void { this.machine = m; }
+  setSpritePool(pool: SpritePool): void  { this.spritePool = pool; }
 
   // ---------------------------------------------------------------------------
   // SWI implementations — each method maps to one Wimp_* SWI
@@ -145,7 +149,7 @@ export class WimpManager {
     this.taskHandle = this.nextHandle++;
     regs.write(0, 310);             // Wimp version we claim (3.10)
     regs.write(1, this.taskHandle); // task handle
-    this.host.setIconbarEntry(this.taskHandle, "application", this.taskName);
+    // Iconbar entry is added later via Wimp_CreateIcon(-2), not here
   }
 
   /** Wimp_CreateWindow (SWI 0x400C1) */
@@ -474,7 +478,9 @@ export class WimpManager {
       } else if (icon.text) {
         sprite = icon.text;
       }
-      this.host.setIconbarEntry(iconHandle, sprite, icon.text || sprite);
+      // Look up sprite pixel data for canvas rendering
+      const spriteData: SpriteData | undefined = this.spritePool?.get(sprite);
+      this.host.setIconbarEntry(iconHandle, sprite, icon.text || sprite, spriteData);
       regs.write(0, iconHandle);
       return;
     }

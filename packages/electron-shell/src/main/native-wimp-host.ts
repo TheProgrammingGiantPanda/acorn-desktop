@@ -12,7 +12,7 @@ import {
 import path from "path";
 import type {
   NativeHost, NativeMenuItem, DrawCommand,
-  WimpWindowDef, WimpIcon, WimpPollEvent,
+  WimpWindowDef, WimpIcon, WimpPollEvent, SpriteData,
 } from "@theprogramminggiantpanda/risc-os";
 import { WimpEvent, WimpMsg, osUnitsToPx } from "@theprogramminggiantpanda/risc-os";
 
@@ -53,7 +53,7 @@ export class NativeWimpHost implements NativeHost {
 
   /** Iconbar BrowserWindow */
   private iconbarWin: BrowserWindow | null = null;
-  private iconbarEntries = new Map<number, { sprite: string; text: string }>();
+  private iconbarEntries = new Map<number, { sprite: string; text: string; spriteData?: SpriteData }>();
 
   constructor() {
     this.createIconbar();
@@ -227,14 +227,30 @@ export class NativeWimpHost implements NativeHost {
     });
   }
 
-  setIconbarEntry(taskHandle: number, sprite: string, text: string): void {
-    this.iconbarEntries.set(taskHandle, { sprite, text });
-    this.iconbarWin?.webContents.send("iconbar-update", [...this.iconbarEntries.entries()]);
+  setIconbarEntry(taskHandle: number, sprite: string, text: string, spriteData?: SpriteData): void {
+    this.iconbarEntries.set(taskHandle, { sprite, text, spriteData });
+    this.sendIconbarUpdate();
   }
 
   removeIconbarEntry(taskHandle: number): void {
     this.iconbarEntries.delete(taskHandle);
-    this.iconbarWin?.webContents.send("iconbar-update", [...this.iconbarEntries.entries()]);
+    this.sendIconbarUpdate();
+  }
+
+  private sendIconbarUpdate(): void {
+    if (!this.iconbarWin || this.iconbarWin.isDestroyed()) return;
+    // Serialise: transfer RGBA as a plain Array so it survives IPC serialisation
+    const payload = [...this.iconbarEntries.entries()].map(([handle, entry]) => [
+      handle,
+      {
+        sprite: entry.sprite,
+        text: entry.text,
+        spriteData: entry.spriteData
+          ? { rgba: Array.from(entry.spriteData.rgba), width: entry.spriteData.width, height: entry.spriteData.height, name: entry.spriteData.name }
+          : undefined,
+      },
+    ]);
+    this.iconbarWin.webContents.send("iconbar-update", payload);
   }
 
   // --------------------------------------------------------------------------
@@ -297,6 +313,8 @@ export class NativeWimpHost implements NativeHost {
     });
     this.iconbarWin.loadURL(rendererURL("iconbar.html"));
     this.iconbarWin.setIgnoreMouseEvents(false);
+    // Resend all entries once the page is ready (fixes race condition)
+    this.iconbarWin.webContents.on("did-finish-load", () => this.sendIconbarUpdate());
   }
 
   private listenIPC(): void {

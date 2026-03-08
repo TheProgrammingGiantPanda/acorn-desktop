@@ -17,12 +17,21 @@ import type { SystemBus } from "../memory/bus.js";
 import { Logger } from "@theprogramminggiantpanda/shared";
 
 /**
+ * Called after the ROM's SWI handler returns (MOVS PC, R14_svc or LDM^).
+ * At this point registers reflect the state the ROM left them in.
+ */
+export type SwiReturnHook = (regs: RegisterFile, bus: SystemBus) => void;
+
+/**
  * A SWI handler receives the live register file and system bus.
  * Returning `'passthrough'` causes the CPU to fall through to the ROM's own
  * SWI vector, which is useful when a handler wants to service only a subset
  * of calls (e.g. HostFS for "HostFS::" paths, ROM FileSwitch for everything else).
+ * Returning `{ passthrough: true, afterReturn }` also passthroughs to ROM, and
+ * additionally fires `afterReturn` once the ROM's SWI handler returns to its caller.
  */
-export type SwiHandler = (regs: RegisterFile, bus: SystemBus) => 'passthrough' | void;
+export type SwiHandler = (regs: RegisterFile, bus: SystemBus) =>
+  'passthrough' | { passthrough: true; afterReturn: SwiReturnHook } | void;
 
 /** Exception vector addresses (ARM2 standard) */
 const VECTOR_RESET   = 0x00000000;
@@ -231,8 +240,10 @@ export class ARM2CPU {
 
     if (S) {
       if (Rd === 15) {
-        // S + Rd=15: restore PSR from SPSR
+        // S + Rd=15: restore PSR from SPSR (canonical SWI/IRQ/FIQ return)
+        const wasMode = this.regs.mode;
         this.regs.restorePSR(this.regs.mode);
+        if (wasMode === Mode.Supervisor) this._fireSwiReturn();
       } else {
         // Set flags from result
         this.regs.setNZ(result);
@@ -378,7 +389,10 @@ export class ARM2CPU {
     }
 
     if (S && L && (rlist & 0x8000)) {
+      // LDM^ with PC in list: PSR restore (also covers SWI return via LDM)
+      const wasMode = this.regs.mode;
       this.regs.restorePSR(this.regs.mode);
+      if (wasMode === Mode.Supervisor) this._fireSwiReturn();
     }
   }
 
@@ -418,6 +432,13 @@ export class ARM2CPU {
   /** True while waiting for an async SWI (e.g. Wimp_Poll) to complete */
   swiPending = false;
 
+  /**
+   * Stack of callbacks to fire when the ROM's SWI handler returns.
+   * Pushed by handlers that return `{ passthrough: true, afterReturn }`;
+   * popped and called when a PSR-restoring return is detected in Supervisor mode.
+   */
+  private readonly _swiReturnStack: SwiReturnHook[] = [];
+
   /** Enable SWI call tracing to stdout */
   private _swiSeen = new Set<number>();
 
@@ -431,9 +452,25 @@ export class ARM2CPU {
     }
     if (handler) {
       const result = handler(this.regs, this.bus);
-      if (result !== 'passthrough') return;
+      if (!result) return;
+      if (result === 'passthrough') {
+        this.takeException(VECTOR_SWI, Mode.Supervisor);
+        return;
+      }
+      // { passthrough: true, afterReturn } — queue the hook then vector to ROM
+      this._swiReturnStack.push(result.afterReturn);
     }
     this.takeException(VECTOR_SWI, Mode.Supervisor);
+  }
+
+  /**
+   * Fire the topmost pending SWI-return hook (if any).
+   * Called when a PSR-restoring return (MOVS PC or LDM^) is detected
+   * while in Supervisor mode — the canonical SWI return sequence.
+   */
+  private _fireSwiReturn(): void {
+    const hook = this._swiReturnStack.pop();
+    if (hook) hook(this.regs, this.bus);
   }
 
   /** Resume after an async SWI completes (called externally) */
