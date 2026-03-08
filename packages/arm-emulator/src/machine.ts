@@ -10,6 +10,7 @@ import { ARM2CPU, type SwiHandler, type CpuVariant } from "./cpu/arm2.js";
 import { SystemBus } from "./memory/bus.js";
 import { MEMC } from "./chips/memc.js";
 import { IOC }  from "./chips/ioc.js";
+import { VIDC } from "./chips/vidc.js";
 import type { MachineConfig } from "@theprogramminggiantpanda/shared";
 import { Logger } from "@theprogramminggiantpanda/shared";
 
@@ -18,10 +19,11 @@ const ARM3_CLOCK_HZ = 25_000_000;
 const STEPS_PER_TICK = 10_000; // instructions per setTimeout slice
 
 export class ArchimedesMachine {
-  readonly cpu: ARM2CPU;
-  readonly bus: SystemBus;
+  readonly cpu:  ARM2CPU;
+  readonly bus:  SystemBus;
   readonly memc: MEMC;
   readonly ioc:  IOC;
+  readonly vidc: VIDC;
 
   private running  = false;
   private paused   = false;
@@ -43,16 +45,8 @@ export class ArchimedesMachine {
     this.memc = new MEMC();
     this.ioc  = new IOC();
 
-    // VIDC stub — satisfies bus constructor but does nothing (no hardware rendering)
-    const vidcStub = {
-      write: () => {},
-      displayWidth:  640,
-      displayHeight: 512,
-      bpp:           4 as 4,
-      renderFrame:   () => {},
-    } as unknown as import("./chips/vidc.js").VIDC;
-
-    this.bus = new SystemBus(config.ramSize, vidcStub, this.memc, this.ioc);
+    this.vidc = new VIDC();
+    this.bus = new SystemBus(config.ramSize, this.vidc, this.memc, this.ioc);
     this.cpu = new ARM2CPU(this.bus, config.cpuVariant as CpuVariant, logger);
 
     this.ioc.onIRQ = () => this.cpu.triggerIRQ();
@@ -106,6 +100,46 @@ export class ArchimedesMachine {
    */
   writePhysical(physOffset: number, data: Uint8Array): void {
     this.bus.dmaWrite(physOffset, data);
+  }
+
+  /**
+   * Capture the VIDC frame buffer and extract the rectangular region that
+   * corresponds to a RISC OS window's visible area.
+   *
+   * @param osX0/osY0/osX1/osY1  Window visible area in OS units (Y increases upward)
+   * @returns RGBA pixel data + dimensions, or null if the screen isn't set up yet
+   */
+  captureWindowRegion(
+    osX0: number, osY0: number, osX1: number, osY1: number,
+  ): { pixels: Uint8ClampedArray; width: number; height: number } | null {
+    const sw = this.vidc.displayWidth;
+    const sh = this.vidc.displayHeight;
+    if (sw <= 0 || sh <= 0) return null;
+
+    const bpp      = this.vidc.bpp;
+    const frameLen = Math.ceil(sw * sh * bpp / 8);
+    const screenRAM = this.bus.dmaRead(this.memc.videoDMAStart, frameLen);
+
+    const fullRGBA = new Uint8ClampedArray(sw * sh * 4);
+    this.vidc.renderFrame(screenRAM, fullRGBA);
+
+    // OS units → pixels  (typically 2 OS units = 1 pixel)
+    const px0 = Math.max(0, Math.min(sw, Math.round(osX0 / 2)));
+    const px1 = Math.max(0, Math.min(sw, Math.round(osX1 / 2)));
+    // RISC OS Y increases upward; frame buffer Y=0 is at the top
+    const py0 = Math.max(0, Math.min(sh, sh - Math.round(osY1 / 2)));
+    const py1 = Math.max(0, Math.min(sh, sh - Math.round(osY0 / 2)));
+
+    const rw = px1 - px0;
+    const rh = py1 - py0;
+    if (rw <= 0 || rh <= 0) return null;
+
+    const pixels = new Uint8ClampedArray(rw * rh * 4);
+    for (let y = 0; y < rh; y++) {
+      const srcOff = ((py0 + y) * sw + px0) * 4;
+      pixels.set(fullRGBA.subarray(srcOff, srcOff + rw * 4), y * rw * 4);
+    }
+    return { pixels, width: rw, height: rh };
   }
 
   /**

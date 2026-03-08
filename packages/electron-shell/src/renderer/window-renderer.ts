@@ -16,6 +16,7 @@ declare global {
       onDraw:  (cb: (cmds: DrawCommand[]) => void) => void;
       onUpdateIcon: (cb: (data: { iconHandle: number; icon: IconData }) => void) => void;
       onResize: (cb: () => void) => void;
+      onPixels: (cb: (data: { width: number; height: number; pixels: Uint8Array }) => void) => void;
     };
   }
 }
@@ -147,3 +148,14 @@ function specialKey(key: string): number {
   };
   return map[key] ?? -1;
 }
+
+// ---------------------------------------------------------------------------
+// VIDC frame buffer pixels from main process
+// ---------------------------------------------------------------------------
+window.wimpWindow.onPixels(({ width, height, pixels }) => {
+  const rgba = new Uint8ClampedArray(pixels.buffer, pixels.byteOffset, pixels.byteLength);
+  const imageData = new ImageData(rgba, width, height);
+  canvas.width  = width;
+  canvas.height = height;
+  ctx.putImageData(imageData, 0, 0);
+});

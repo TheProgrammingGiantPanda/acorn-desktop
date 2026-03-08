@@ -212,17 +212,41 @@ export class WimpManager {
     this.machine.wakeFromSWI();
   }
 
-  /** Wimp_RedrawWindow (SWI 0x400C8) — first call sets up redraw loop */
+  /** Wimp_RedrawWindow (SWI 0x400C8) — enters the redraw loop */
   redrawWindow(regs: RegisterFile, bus: SystemBus): void {
     const blockAddr = regs.read(1);
     const handle    = bus.read32(blockAddr) | 0;
-    const win = this.windows.get(handle);
-    // Return "more = 0" — simplified: tell app there's one rectangle to redraw
-    // In a full implementation we'd track dirty rectangles
-    regs.write(0, 0); // no more rectangles after this
+    const win       = this.windows.get(handle);
+    if (win) {
+      writeWindowState(bus, blockAddr, win);
+      regs.write(0, 1); // non-zero = there is a rectangle to redraw
+    } else {
+      regs.write(0, 0); // unknown window — nothing to draw
+    }
+  }
 
-    // Write visible area / origin back to block
-    if (win) writeWindowState(bus, blockAddr, win);
+  /**
+   * Wimp_GetRectangle (SWI 0x400CA) — advances the redraw loop.
+   *
+   * We always return R0=0 (no more rectangles) since we give apps one
+   * dirty rect per redraw event.  Before returning we capture the window's
+   * region from the VIDC frame buffer and push the pixels to the native canvas.
+   */
+  getWindowRect(regs: RegisterFile, bus: SystemBus): void {
+    const blockAddr = regs.read(1);
+    const handle    = bus.read32(blockAddr) | 0;
+    const win       = this.windows.get(handle);
+
+    regs.write(0, 0); // no more rectangles
+
+    if (win?.open) {
+      const result = this.machine.captureWindowRegion(
+        win.def.visX0, win.def.visY0, win.def.visX1, win.def.visY1,
+      );
+      if (result) {
+        this.host.updateWindowPixels(handle, result.pixels, result.width, result.height);
+      }
+    }
   }
 
   /** Wimp_GetWindowState (SWI 0x400CB) */

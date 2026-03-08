@@ -175,6 +175,7 @@ export class SwiDispatcher {
 
     cpu.swiHandlers.set(SWI.Wimp_RedrawWindow,    (r, b) => w.redrawWindow(r, b));
     cpu.swiHandlers.set(SWI.Wimp_UpdateWindow,    (r, b) => w.redrawWindow(r, b));
+    cpu.swiHandlers.set(SWI.Wimp_GetRectangle,    (r, b) => w.getWindowRect(r, b));
     cpu.swiHandlers.set(SWI.Wimp_GetWindowState,  (r, b) => w.getWindowState(r, b));
     cpu.swiHandlers.set(SWI.Wimp_ForceRedraw,     (r, b) => w.forceRedraw(r, b));
     cpu.swiHandlers.set(SWI.Wimp_CreateIcon,      (r, b) => w.createIcon(r, b));
@@ -195,21 +196,10 @@ export class SwiDispatcher {
     cpu.swiHandlers.set(SWI.OS_SpriteOp,  (r, b) => spriteHandler.handleOS(r, b));
     cpu.swiHandlers.set(SWI.Wimp_SpriteOp,(r, b) => spriteHandler.handleWimp(r, b));
 
-    // Stubs for less critical SWIs — acknowledge without doing anything
-    const stub = () => {};
-    for (const n of [
-      SWI.Wimp_GetWindowInfo, SWI.Wimp_SetIconState, SWI.Wimp_GetIconState,
-      SWI.Wimp_DragBox, SWI.Wimp_SetCaretPosition, SWI.Wimp_GetCaretPosition,
-      SWI.Wimp_DecodeMenu, SWI.Wimp_WhichIcon, SWI.Wimp_SetExtent,
-      SWI.Wimp_SetPointerShape, SWI.Wimp_OpenTemplate, SWI.Wimp_CloseTemplate,
-      SWI.Wimp_LoadTemplate, SWI.Wimp_ProcessKey,
-      // Wimp_StartTask (0x400DE) is intentionally absent — passthrough to ROM
-      SWI.Wimp_GetWindowOutline, SWI.Wimp_PlotIcon, SWI.Wimp_SetMode,
-      SWI.Wimp_CreateSubMenu, SWI.Wimp_SetFontColours,
-      SWI.Wimp_GetMenuState, SWI.Wimp_TextColour,
-    ]) {
-      cpu.swiHandlers.set(n, stub);
-    }
+    // All remaining Wimp_* SWIs passthrough to ROM.
+    // The ROM's Wimp handles GetWindowInfo, SetIconState, ProcessKey, SetExtent,
+    // SetMode, etc. correctly.  No-op stubs were actively harmful — they
+    // returned zeroed registers where apps expected real data.
 
     // ── File system ───────────────────────────────────────────────────────────
     if (fs) {
@@ -223,13 +213,7 @@ export class SwiDispatcher {
       cpu.swiHandlers.set(SWI.OS_FSControl, (r, b) => fsHandler.fsControl(r, b));
     }
 
-    // Font stubs
-    for (const n of [
-      SWI.Font_FindFont, SWI.Font_LoseFont, SWI.Font_Paint,
-      SWI.Font_StringWidth, SWI.Font_SetFontColours,
-    ]) {
-      cpu.swiHandlers.set(n, stub);
-    }
+    // Font_* SWIs passthrough to ROM — the ROM's font manager handles them.
 
   }
 
