@@ -15,6 +15,7 @@ import type {
   WimpWindowDef, WimpIcon, WimpPollEvent, SpriteData,
 } from "@theprogramminggiantpanda/risc-os";
 import { WimpEvent, WimpMsg, osUnitsToPx } from "@theprogramminggiantpanda/risc-os";
+import { Logger } from "@theprogramminggiantpanda/shared";
 
 const isDev = !require("electron").app.isPackaged;
 
@@ -55,7 +56,7 @@ export class NativeWimpHost implements NativeHost {
   private iconbarWin: BrowserWindow | null = null;
   private iconbarEntries = new Map<number, { sprite: string; text: string; spriteData?: SpriteData }>();
 
-  constructor() {
+  constructor(private readonly logger: Logger = new Logger()) {
     this.createIconbar();
     this.listenIPC();
   }
@@ -65,6 +66,7 @@ export class NativeWimpHost implements NativeHost {
   // --------------------------------------------------------------------------
 
   createWindow(handle: number, def: WimpWindowDef): void {
+    this.logger.debug(`[NativeWimpHost] createWindow handle=${handle} title="${def.title}"`);
     const rect = osRect(def);
     const win = new BrowserWindow({
       x: rect.x,
@@ -126,6 +128,7 @@ export class NativeWimpHost implements NativeHost {
       |"workX0"|"workY0"|"workX1"|"workY1"|"flags">
   ): void {
     const win = this.windows.get(handle);
+    this.logger.debug(`[NativeWimpHost] openWindow handle=${handle} found=${!!win}`);
     if (!win) return;
     this.windowScroll.set(handle, { scrollX: def.scrollX, scrollY: def.scrollY });
     const rect = osRect(def);
@@ -147,10 +150,12 @@ export class NativeWimpHost implements NativeHost {
   }
 
   closeWindow(handle: number): void {
+    this.logger.debug(`[NativeWimpHost] closeWindow handle=${handle}`);
     this.windows.get(handle)?.hide();
   }
 
   destroyWindow(handle: number): void {
+    this.logger.debug(`[NativeWimpHost] destroyWindow handle=${handle}`);
     const win = this.windows.get(handle);
     if (win && !win.isDestroyed()) win.destroy();
     this.windows.delete(handle);
@@ -220,7 +225,7 @@ export class NativeWimpHost implements NativeHost {
   }
 
   setIconbarEntry(taskHandle: number, sprite: string, text: string, spriteData?: SpriteData): void {
-    console.log(`[NativeWimpHost] setIconbarEntry handle=${taskHandle} sprite="${sprite}" text="${text}" hasSprite=${!!spriteData}`);
+    this.logger.debug(`[NativeWimpHost] setIconbarEntry handle=${taskHandle} sprite="${sprite}" text="${text}" hasSprite=${!!spriteData}`);
     this.iconbarEntries.set(taskHandle, { sprite, text, spriteData });
     this.sendIconbarUpdate();
   }
@@ -232,10 +237,10 @@ export class NativeWimpHost implements NativeHost {
 
   private sendIconbarUpdate(): void {
     if (!this.iconbarWin || this.iconbarWin.isDestroyed()) {
-      console.log(`[NativeWimpHost] sendIconbarUpdate: iconbarWin not ready (null=${!this.iconbarWin} destroyed=${this.iconbarWin?.isDestroyed()})`);
+      this.logger.debug(`[NativeWimpHost] sendIconbarUpdate: iconbarWin not ready (null=${!this.iconbarWin} destroyed=${this.iconbarWin?.isDestroyed()})`);
       return;
     }
-    console.log(`[NativeWimpHost] sendIconbarUpdate: ${this.iconbarEntries.size} entries`);
+    this.logger.debug(`[NativeWimpHost] sendIconbarUpdate: ${this.iconbarEntries.size} entries`);
     // Serialise: transfer RGBA as a plain Array so it survives IPC serialisation
     const payload = [...this.iconbarEntries.entries()].map(([handle, entry]) => [
       handle,
@@ -256,6 +261,7 @@ export class NativeWimpHost implements NativeHost {
 
   /** Deliver an event: wake a waiting Wimp_Poll or queue it */
   deliverEvent(ev: WimpPollEvent): void {
+    this.logger.debug(`[NativeWimpHost] deliverEvent code=${ev.code} data=[${ev.data.slice(0,3).join(',')}] resolvers=${this.pollResolvers.length} pending=${this.pendingEvents.length}`);
     if (this.pollResolvers.length > 0) {
       const resolve = this.pollResolvers.shift()!;
       resolve(ev);

@@ -7,6 +7,7 @@
 
 import type { ArchimedesMachine } from "@theprogramminggiantpanda/arm-emulator";
 import type { NativeHost } from "../wimp/native-host.js";
+import { Logger } from "@theprogramminggiantpanda/shared";
 import type { FileSystemHost } from "../fs/fs-host.js";
 import { WimpManager } from "../wimp/wimp-manager.js";
 import { OSFileHandler } from "../fs/os-fs.js";
@@ -34,6 +35,8 @@ export interface DispatcherOptions {
   fs?: FileSystemHost;
   /** Called when an Obey Run command targets an ARM binary */
   onRunBinary?: (riscosPath: string) => void;
+  /** Logger instance — defaults to silent */
+  logger?: Logger;
 }
 
 export class SwiDispatcher {
@@ -48,7 +51,7 @@ export class SwiDispatcher {
     host: NativeHost,
     options: DispatcherOptions = {},
   ) {
-    this.wimp        = new WimpManager(host);
+    this.wimp        = new WimpManager(host, options.logger);
     this.wimp.setMachine(machine);
     this.sysvar      = new SystemVariables();
     this.spriteAreas = new SpriteAreaRegistry();

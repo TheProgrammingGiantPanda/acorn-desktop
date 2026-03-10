@@ -42,13 +42,6 @@ interface CamEntry {
 export class MEMC {
   control = 0;
 
-  /**
-   * Called once when the ROM alias should be released.
-   * The system bus sets this to clear its `romActive` flag.
-   * On real hardware any write to the MEMC control register removes the alias.
-   */
-  onRomAliasRelease?: () => void;
-
   /** Video DMA start address (physical) */
   videoDMAStart = 0x0200_0000;
   /** Video DMA end address (physical) */
@@ -99,26 +92,49 @@ export class MEMC {
   }
 
   writeControl(offset: number, value: number): void {
+    // Legacy path: data-value-based register writes (offset from MEMC_CTL_BASE).
+    // On real hardware MEMC is address-encoded; this handles any remaining cases.
     switch (offset & 0xFF) {
-      case 0x00:
-        // Any write to the MEMC control register releases the ROM alias.
-        this.onRomAliasRelease?.();
-        this.control = value;
-        break;
-      case 0x04:
-        this.videoDMAStart = value & 0x03FF_FFFC;
-        break;
-      case 0x08:
-        this.videoDMAEnd = value & 0x03FF_FFFC;
-        break;
-      case 0x0C:
-        this.soundDMAStart = value & 0x03FF_FFFC;
+      case 0x00: this.control        = value; break;
+      case 0x04: this.videoDMAStart  = value & 0x03FF_FFFC; break;
+      case 0x08: this.videoDMAEnd    = value & 0x03FF_FFFC; break;
+      case 0x0C: this.soundDMAStart  = value & 0x03FF_FFFC; break;
+    }
+  }
+
+  /**
+   * Handle a write to the DMA control range (0x3600000–0x37FFFFF).
+   * Only the write address encodes the DMA register — data is ignored.
+   * The sub-ranges within the DMA space program video/sound buffer addresses.
+   */
+  writeDma(offset: number): void {
+    // DMA address generation — address-encoded, data ignored (matches ArcEm DMA_PutVal).
+    // Region number = bits[19:17] of offset (each region is 128 KB).
+    // RegVal       = bits[16:2] of offset (used to set the address register).
+    //
+    // Region map (from Acorn MEMC datasheet / ArcEm):
+    //   0: Vinit   (video init pointer)
+    //   1: Vstart  (video DMA start)
+    //   2: Vend    (video DMA end)
+    //   3: Cinit   (cursor init — not used in emulation)
+    //   4: Sstart  (sound DMA start)
+    //   5: SendN   (sound DMA next end — not used)
+    //   6: Sptr    (sound pointer — not used)
+    //   7: MEMC control register (page size, OS mode, etc.)
+    const region = (offset >>> 17) & 7;
+    const regVal  = (offset >>> 2) & 0x7FFF; // 15-bit value
+    switch (region) {
+      case 1: this.videoDMAStart = regVal << 2; break;
+      case 2: this.videoDMAEnd   = regVal << 2; break;
+      case 4: this.soundDMAStart = regVal << 2; break;
+      case 7: // MEMC control register (bits[3:2] = page size index)
+        this.control = offset & 0x1FFF;
         break;
     }
   }
 
   /**
-   * Decode a CAM entry from a write-address offset (relative to CAM_BASE).
+   * Decode a CAM entry from a write-address offset (relative to ROM_HIGH_BASE = 0x3800000).
    * The data value is ignored per hardware spec — only the address matters.
    *
    * Address layout (4 KB pages, S=0):
@@ -139,6 +155,7 @@ export class MEMC {
 
     if (lpn < this.cam.length) {
       this.cam[lpn] = { valid: true, ppn, ppl };
+      console.debug(`[MEMC] CAM write S=${s} LPN=${lpn} PPL=${ppl} PPN=${ppn} log=0x${(lpn << pageShift).toString(16)} phys=0x${((0x2000000 + ppn * (1 << pageShift)) >>> 0).toString(16)}`);
     }
   }
 
@@ -153,11 +170,8 @@ export class MEMC {
     const lpn       = logical >>> pageShift;
 
     if (lpn >= this.maxCamEntries) {
-      // Above the MEMC logical window (always 512 KB regardless of page size).
-      // Real RISC OS handles this with OS-level page-fault remapping; our
-      // emulator instead extends the mapping linearly so AIF compressed
-      // binaries can reach decompressed code above the 512 KB boundary.
-      return PHYS_RAM_BASE + logical;
+      // Above the MEMC logical window — abort (no CAM entry possible).
+      return null;
     }
 
     const entry = this.cam[lpn];

@@ -36,14 +36,15 @@ export function generateHostFsModule(moduleBase: number): Uint8Array {
   w(40, 0);                  // word 10: SWI decoding code (none)
 
   // ── Init entry (offset 44, 6 instructions × 4 bytes = 24 bytes) ──────────
-  // When called, PC is moduleBase+44; "PC" as seen by ADD is moduleBase+44+8 = moduleBase+52
-  // We need R1 → moduleBase+208 (FS info block)
-  // ADD R1, PC, #N where PC+8 = moduleBase+52 → N = 208 - 52 = 156 = 0x9C
+  // ADD R1, PC, #N where instruction is at offset 48, so PC+8 = moduleBase+56.
+  // FS info block is at offset 208 → N = 208 - 56 = 152 = 0x98
+  // Use X-form SWI (OS_FSControl + 0x20000) so errors return V set rather than
+  // invoking OS_GenerateError, which would skip the sentinel SWI.
   w(44, 0xE3A0000C);         // MOV R0, #12            (OS_FSControl reason 12 = AddFS)
-  w(48, 0xE28F109C);         // ADD R1, PC, #156       (PC+8 at this point = moduleBase+52, +156 = moduleBase+208)
+  w(48, 0xE28F1098);         // ADD R1, PC, #152       (PC+8 = moduleBase+56; +152 = moduleBase+208)
   w(52, 0xE3A02000);         // MOV R2, #0
   w(56, 0xE3A03000);         // MOV R3, #0
-  w(60, 0xEF000019);         // SWI OS_FSControl        (register FS; passthroughs to ROM)
+  w(60, 0xEF020019);         // SWI XOS_FSControl       (X-form: V set on error, no OS_GenerateError)
   w(64, 0xEF041510);         // SWI 0x041510            (sentinel: signals init done to JS)
 
   // ── Service entry (offset 68, 5 instructions × 4 bytes = 20 bytes) ───────

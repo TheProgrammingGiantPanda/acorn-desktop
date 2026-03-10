@@ -48,8 +48,8 @@ function parseAppArg(): string | undefined {
 
 const defaultConfig: MachineConfig = {
   model:           "A310",
-  ramSize:         1 * 1024 * 1024,
-  cpuVariant:      "ARM2",
+  ramSize:         4 * 1024 * 1024,
+  cpuVariant:      "ARM3",
   speedMultiplier: 1.0,
 };
 let config: MachineConfig = { ...defaultConfig };
@@ -237,7 +237,7 @@ function startMachine(romData: Uint8Array, appHostPath?: string): void {
   const nodeFs = new NodeFsHost(fsRoot);
 
   machine    = new ArchimedesMachine(config, logger);
-  wimpHost   = new NativeWimpHost();
+  wimpHost   = new NativeWimpHost(logger);
 
   // obeyFs is used only for bootAllApps() pre-boot !Boot scripts.
   // In ROM boot mode the real ROM CLI/FileSwitch handles all app launching.
@@ -247,6 +247,7 @@ function startMachine(romData: Uint8Array, appHostPath?: string): void {
       launcherWindow?.webContents.send("console-output", text);
     },
     obeyFs: nodeFs,
+    logger,
   });
 
   // Register HostFS: intercepts OS_File/OS_Find/OS_GBPB/OS_Args for "HostFS::"
@@ -397,7 +398,7 @@ function onSetCPU(variant: "ARM2" | "ARM3"): void {
 ipcMain.handle(IPC.DRAG_FILE, async (_ev, filePath: string) => {
   if (!fs.existsSync(filePath)) return;
   const ext = path.extname(filePath).toLowerCase();
-  if ([".rom", ".bin", ".img"].includes(ext)) {
+  if ([".rom", ".bin", ".img"].includes(ext) || filePath.endsWith(",ffd")) {
     const data = fs.readFileSync(filePath);
     startMachine(new Uint8Array(data));
   }
@@ -459,11 +460,11 @@ function tryAutoLoadROM(): void {
     files = fs.readdirSync(romsDir);
   } catch { /* directory missing — fall through to error */ }
 
-  const romFile = files.find(f => /\.(rom|bin|img)$/i.test(f));
+  const romFile = files.find(f => /\.(rom|bin|img)$/i.test(f) || /,ffd$/i.test(f));
   if (!romFile) {
     dialog.showErrorBox(
       "No ROM found",
-      `Place a RISC OS ROM image (.rom, .bin, or .img) in:\n\n${romsDir}`,
+      `Place a RISC OS ROM image (.rom, .bin, .img, or ,ffd) in:\n\n${romsDir}`,
     );
     app.quit();
     return;

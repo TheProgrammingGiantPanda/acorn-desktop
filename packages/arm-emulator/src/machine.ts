@@ -16,7 +16,7 @@ import { Logger } from "@theprogramminggiantpanda/shared";
 
 const ARM2_CLOCK_HZ = 8_000_000;
 const ARM3_CLOCK_HZ = 25_000_000;
-const STEPS_PER_TICK = 10_000; // instructions per setTimeout slice
+const STEPS_PER_TICK = 100_000; // instructions per setTimeout slice
 
 export class ArchimedesMachine {
   readonly cpu:  ARM2CPU;
@@ -331,6 +331,7 @@ export class ArchimedesMachine {
    */
   bootROM(): void {
     this.reset();
+    this.logger.debug(`[ROM] size=${this.bus.romSize} bytes`);
     this.running   = true;
     this.paused    = false;
     this.romBooted = true;
@@ -361,22 +362,35 @@ export class ArchimedesMachine {
   private tick(): void {
     if (!this.running || this.paused) return;
 
-    const clockHz  = (this.config.cpuVariant === "ARM3" ? ARM3_CLOCK_HZ : ARM2_CLOCK_HZ)
-                     * this.config.speedMultiplier;
+    const baseClockHz = this.config.cpuVariant === "ARM3" ? ARM3_CLOCK_HZ : ARM2_CLOCK_HZ;
+    const clockHz  = baseClockHz * this.config.speedMultiplier;
     const steps    = this.config.speedMultiplier === 0
       ? STEPS_PER_TICK * 10   // uncapped
       : STEPS_PER_TICK;
 
+    // Sub-batch CPU execution so the IOC timer ticks at the correct rate
+    // relative to the CPU (IOC runs at 2 MHz, ARM2 at 8 MHz → 1 IOC tick per
+    // 4 CPU instructions).  Without sub-batching the timer reads 0 elapsed
+    // inside the ROM's short calibration delay loops, causing an infinite loop.
+    // In uncapped mode (speedMultiplier=0) use the base clock for IOC timing.
+    const iocClockHz = this.config.speedMultiplier === 0 ? baseClockHz : clockHz;
+    const SUB_BATCH = 1000; // instructions between IOC ticks
+    const subUs = Math.floor((SUB_BATCH / iocClockHz) * 1_000_000);
+    let remaining = steps;
     try {
-      this.cpu.step(steps);
+      while (remaining > 0 && !this.cpu.swiPending) {
+        const n = Math.min(SUB_BATCH, remaining);
+        this.cpu.step(n);
+        this.ioc.tick(subUs);
+        remaining -= n;
+      }
     } catch (err) {
       const pc = this.cpu.regs.pc.toString(16).padStart(8, '0');
       this.logger.error(`[CPU crash] PC=0x${pc} — ${err}`);
       this.running = false;
       return;
     }
-    const stepUs = Math.floor((steps / clockHz) * 1_000_000);
-    this.ioc.tick(stepUs);
+    const stepUs = Math.floor(((steps - remaining) / clockHz) * 1_000_000);
 
     // Fire vertical-blank interrupt at ~50 Hz so the ROM task switcher wakes.
     this.vblAccumUs += stepUs;
@@ -385,13 +399,14 @@ export class ArchimedesMachine {
       this.ioc.vblank();
     }
 
-    // MHz measurement
+    // MHz measurement + heartbeat
     const now = Date.now();
     if (now - this.lastMeasure >= 1000) {
       const delta = this.cpu.cycleCount - this.cycleSnapshot;
       this.mhz = parseFloat((delta / 1_000_000).toFixed(2));
       this.cycleSnapshot = this.cpu.cycleCount;
       this.lastMeasure   = now;
+      this.logger.debug(`[CPU] heartbeat mhz=${this.mhz} PC=0x${this.cpu.regs.pc.toString(16).padStart(8,'0')} swiPending=${this.cpu.swiPending}`);
     }
 
     // Keep looping unless a SWI put the CPU into pending state

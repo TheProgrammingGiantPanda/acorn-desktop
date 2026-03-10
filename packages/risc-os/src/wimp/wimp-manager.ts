@@ -19,6 +19,7 @@
 import type { RegisterFile, SwiReturnHook } from "@theprogramminggiantpanda/arm-emulator";
 import type { SystemBus }    from "@theprogramminggiantpanda/arm-emulator";
 import type { NativeHost, NativeMenuItem } from "./native-host.js";
+import { Logger } from "@theprogramminggiantpanda/shared";
 import {
   type WimpWindowDef, type WimpIcon, type WimpWindow,
   WimpEvent, IF_INDIRECTED, IF_TEXT,
@@ -142,7 +143,10 @@ export class WimpManager {
   private fgColour = "#000000";
   private pendingCmds: import("./native-host.js").DrawCommand[] = [];
 
-  constructor(private readonly host: NativeHost) {}
+  constructor(
+    private readonly host: NativeHost,
+    private readonly logger: Logger = new Logger(),
+  ) {}
 
   setMachine(m: ArchimedesMachine): void { this.machine = m; }
   setSpritePool(pool: SpritePool): void  { this.spritePool = pool; }
@@ -175,6 +179,7 @@ export class WimpManager {
    */
   initialise(regs: RegisterFile, bus: SystemBus): WR {
     const name = readString(bus, regs.read(2));
+    this.logger.debug(`[Wimp_Initialise] task="${name}" → passthrough to ROM`);
     return {
       passthrough: true,
       afterReturn: (_r) => {
@@ -183,7 +188,7 @@ export class WimpManager {
         const task: WimpTask = { handle, name, physBase, windows: new Set() };
         this.tasks.set(handle, task);
         this.tasksByPhysBase.set(physBase, task);
-        console.log(`[Wimp_Initialise] task="${name}" handle=${handle} physBase=0x${physBase.toString(16)}`);
+        this.logger.debug(`[Wimp_Initialise] afterReturn: task="${name}" handle=${handle} physBase=0x${physBase.toString(16)} totalTasks=${this.tasks.size}`);
       },
     };
   }
@@ -196,13 +201,16 @@ export class WimpManager {
   createWindow(regs: RegisterFile, bus: SystemBus): WR {
     const def  = readWindowDef(bus, regs.read(1));
     const task = this.currentTask();
+    this.logger.debug(`[Wimp_CreateWindow] title="${def.title}" task=${task?.handle} → passthrough to ROM`);
     return {
       passthrough: true,
       afterReturn: (r) => {
         const handle = r.read(1);
+        this.logger.debug(`[Wimp_CreateWindow] afterReturn: handle=${handle} title="${def.title}" task=${task?.handle}`);
         this.host.createWindow(handle, def);
         this.windows.set(handle, { handle, def, icons: new Map(), open: false, dirty: true });
         task?.windows.add(handle);
+        this.logger.debug(`[Wimp_CreateWindow] BrowserWindow created handle=${handle} totalWindows=${this.windows.size}`);
       },
     };
   }
@@ -212,6 +220,7 @@ export class WimpManager {
     const blockAddr = regs.read(1);
     const handle = bus.read32(blockAddr) | 0;
     const win    = this.windows.get(handle);
+    this.logger.debug(`[Wimp_OpenWindow] handle=${handle} found=${!!win}`);
     if (win) {
       win.def.visX0   = bus.read32(blockAddr + 4)  | 0;
       win.def.visY0   = bus.read32(blockAddr + 8)  | 0;
@@ -230,6 +239,7 @@ export class WimpManager {
   closeWindow(regs: RegisterFile, bus: SystemBus): WR {
     const handle = bus.read32(regs.read(1)) | 0;
     const win = this.windows.get(handle);
+    this.logger.debug(`[Wimp_CloseWindow] handle=${handle} found=${!!win}`);
     if (win) {
       win.open = false;
       this.host.closeWindow(handle);
@@ -240,9 +250,9 @@ export class WimpManager {
   /** Wimp_DeleteWindow — destroy native window, let ROM clean up */
   deleteWindow(regs: RegisterFile, bus: SystemBus): WR {
     const handle = bus.read32(regs.read(1)) | 0;
+    this.logger.debug(`[Wimp_DeleteWindow] handle=${handle}`);
     this.host.destroyWindow(handle);
     this.windows.delete(handle);
-    // Remove from whichever task owns it
     for (const task of this.tasks.values()) task.windows.delete(handle);
     return 'passthrough';
   }
@@ -266,6 +276,7 @@ export class WimpManager {
 
     // Fast path: native event already waiting
     const pending = this.host.tryPollEvent(mask);
+    this.logger.debug(`[Wimp_Poll] mask=0x${mask.toString(16)} pending=${pending?.code ?? 'none'} task=${this.currentTask()?.handle}`);
     if (pending) {
       for (let i = 0; i < pending.data.length; i++) {
         bus.write32(blockAddr + i * 4, pending.data[i]!);
@@ -274,18 +285,33 @@ export class WimpManager {
       return;
     }
 
+    // Snapshot the current task's physical base so we can reject this hook
+    // if ROM switches to a different task before returning here (cooperative
+    // multitasking: ROM may restore another task's context — same logical
+    // return address, different MEMC mapping).
+    const physBaseAtPush = this.machine.memc.translateAddress(0x8000) ?? 0;
+
     // Let ROM check its own queue (Wimp_SendMessage deliveries, etc.)
     return {
       passthrough: true,
       afterReturn: (r, b) => {
+        const currentPhys = this.machine.memc.translateAddress(0x8000) ?? 0;
+        if (currentPhys !== physBaseAtPush) {
+          // ROM switched to a different task — this is not our return. Decline.
+          return false;
+        }
         const romCode = r.read(0);
+        this.logger.debug(`[Wimp_Poll] afterReturn: ROM returned event=${romCode} task=${this.currentTask()?.handle}`);
         if (romCode !== WimpEvent.Null && !((mask >> romCode) & 1)) {
           // ROM delivered a real unmasked event — already written to the block.
+          this.logger.debug(`[Wimp_Poll] ROM event delivered code=${romCode}`);
           return;
         }
         // ROM returned Null. Suspend and wait for a native event.
+        this.logger.debug(`[Wimp_Poll] suspending CPU, awaiting native event`);
         this.machine.cpu.swiPending = true;
         void this.host.pollEvent(mask).then((ev) => {
+          this.logger.debug(`[Wimp_Poll] native event arrived code=${ev.code} data=[${ev.data.slice(0,4).join(',')}]`);
           for (let i = 0; i < ev.data.length; i++) {
             b.write32(blockAddr + i * 4, ev.data[i]!);
           }
@@ -422,7 +448,7 @@ export class WimpManager {
       const task       = this.currentTask();
       const taskHandle = task?.handle ?? 0;
       const spriteData: SpriteData | undefined = this.spritePool?.get(sprite);
-      console.log(`[Wimp_CreateIcon(-2)] task=${taskHandle} sprite="${sprite}" spriteDataFound=${!!spriteData}`);
+      this.logger.debug(`[Wimp_CreateIcon(-2)] task=${taskHandle} sprite="${sprite}" spriteDataFound=${!!spriteData}`);
       this.host.setIconbarEntry(taskHandle, sprite, text || sprite, spriteData);
     }
 
@@ -443,7 +469,7 @@ export class WimpManager {
       }
       this.tasks.delete(task.handle);
       this.tasksByPhysBase.delete(task.physBase);
-      console.log(`[Wimp_CloseDown] task="${task.name}" handle=${task.handle}`);
+      this.logger.debug(`[Wimp_CloseDown] task="${task.name}" handle=${task.handle}`);
     }
     return 'passthrough';
   }

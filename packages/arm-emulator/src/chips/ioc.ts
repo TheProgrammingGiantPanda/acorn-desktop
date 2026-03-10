@@ -30,15 +30,12 @@ export class IOC {
   private control = 0xFF; // pull-ups give 0xFF on reset
 
   // Interrupt registers
-  private irqAStatus  = 0x00;
-  private irqARequest = 0x00;
-  irqAMask    = 0x00;
-  private irqBStatus  = 0x00;
-  private irqBRequest = 0x00;
-  irqBMask    = 0x00;
-  private fiqStatus   = 0x00;
-  private fiqRequest  = 0x00;
-  fiqMask     = 0x00;
+  private irqAStatus = 0x00;
+  irqAMask   = 0x00;
+  private irqBStatus = 0x00;
+  irqBMask   = 0x00;
+  private fiqStatus  = 0x00;
+  fiqMask    = 0x00;
 
   // Timers (16-bit each)
   private timerLatch = new Uint16Array(4);
@@ -73,18 +70,23 @@ export class IOC {
   static readonly IRQB_NETWORK      = 0x80;
 
   read(offset: number): number {
-    switch (offset & 0xFF) {
+    // IOC data is always on D[7:0]; all registers are at offsets 0x00–0x7C.
+    return this.readByte(offset);
+  }
+
+  private readByte(offset: number): number {
+    switch (offset & 0x7C) {
       case 0x00: return this.control;
       case 0x10: return this.irqAStatus;
-      case 0x14: { const r = this.irqARequest; this.irqARequest = 0; return r; }
+      case 0x14: return this.irqAStatus & this.irqAMask;  // IRQ A request = masked status
       case 0x18: return this.irqAMask;
       case 0x20: return this.irqBStatus;
-      case 0x24: { const r = this.irqBRequest; this.irqBRequest = 0; return r; }
+      case 0x24: return this.irqBStatus & this.irqBMask;  // IRQ B request = masked status
       case 0x28: return this.irqBMask;
       case 0x30: return this.fiqStatus;
-      case 0x34: { const r = this.fiqRequest; this.fiqRequest = 0; return r; }
+      case 0x34: return this.fiqStatus & this.fiqMask;    // FIQ request = masked status
       case 0x38: return this.fiqMask;
-      // Timer read-back (latch value)
+      // Timer read-back (latch value, after a latch command)
       case 0x40: return this.timerLatch[0]! & 0xFF;
       case 0x44: return (this.timerLatch[0]! >>> 8) & 0xFF;
       case 0x50: return this.timerLatch[1]! & 0xFF;
@@ -100,25 +102,56 @@ export class IOC {
   }
 
   write(offset: number, value: number): void {
-    switch (offset & 0xFF) {
-      case 0x00: this.control = value & 0xFF; break;
-      case 0x18: this.irqAMask = value & 0xFF; break;
-      case 0x28: this.irqBMask = value & 0xFF; break;
-      case 0x38: this.fiqMask  = value & 0xFF; break;
+    // IOC data is always on D[7:0]; all registers are at offsets 0x00–0x7C.
+    const byte = value & 0xFF;
+    switch (offset & 0x7C) {
+      case 0x00: this.control = byte; break;
+      // IRQ clear registers: writing 1 bits clears those bits in the status register.
+      // After clearing, re-assert the IRQ line if other bits are still pending
+      // (level-sensitive behaviour — matches real Archimedes hardware).
+      case 0x14:
+        this.irqAStatus &= ~byte;
+        if (this.irqAStatus & this.irqAMask) this.onIRQ?.();
+        break;
+      case 0x24:
+        this.irqBStatus &= ~byte;
+        if (this.irqBStatus & this.irqBMask) this.onIRQ?.();
+        break;
+      case 0x34:
+        this.fiqStatus &= ~byte;
+        if (this.fiqStatus & this.fiqMask) this.onFIQ?.();
+        break;
+      case 0x18:
+        this.irqAMask = byte;
+        if (this.irqAStatus & this.irqAMask) this.onIRQ?.();
+        break;
+      case 0x28:
+        this.irqBMask = byte;
+        if (this.irqBStatus & this.irqBMask) this.onIRQ?.();
+        break;
+      case 0x38:
+        this.fiqMask = byte;
+        if (this.fiqStatus & this.fiqMask) this.onFIQ?.();
+        break;
       // Timer latch writes
-      case 0x40: this.timerLatch[0] = (this.timerLatch[0]! & 0xFF00) | (value & 0xFF); break;
-      case 0x44: this.timerLatch[0] = (this.timerLatch[0]! & 0x00FF) | ((value & 0xFF) << 8); break;
-      case 0x48: // Timer 0 Go
-        this.timerCount[0] = this.timerLatch[0]!;
-        this.timerGo[0] = 1;
-        break;
-      case 0x4C: // Timer 0 Latch (capture current count)
-        this.timerLatch[0] = this.timerCount[0]!;
-        break;
-      case 0x50: this.timerLatch[1] = (this.timerLatch[1]! & 0xFF00) | (value & 0xFF); break;
-      case 0x54: this.timerLatch[1] = (this.timerLatch[1]! & 0x00FF) | ((value & 0xFF) << 8); break;
+      case 0x40: this.timerLatch[0] = (this.timerLatch[0]! & 0xFF00) | byte; break;
+      case 0x44: this.timerLatch[0] = (this.timerLatch[0]! & 0x00FF) | (byte << 8); break;
+      case 0x48: this.timerCount[0] = this.timerLatch[0]!; this.timerGo[0] = 1; break;
+      case 0x4C: this.timerLatch[0] = this.timerCount[0]!; break;
+      case 0x50: this.timerLatch[1] = (this.timerLatch[1]! & 0xFF00) | byte; break;
+      case 0x54: this.timerLatch[1] = (this.timerLatch[1]! & 0x00FF) | (byte << 8); break;
       case 0x58: this.timerCount[1] = this.timerLatch[1]!; this.timerGo[1] = 1; break;
       case 0x5C: this.timerLatch[1] = this.timerCount[1]!; break;
+      // Timer 2 (baud-rate clock — no interrupt raised on expiry)
+      case 0x60: this.timerLatch[2] = (this.timerLatch[2]! & 0xFF00) | byte; break;
+      case 0x64: this.timerLatch[2] = (this.timerLatch[2]! & 0x00FF) | (byte << 8); break;
+      case 0x68: this.timerCount[2] = this.timerLatch[2]!; this.timerGo[2] = 1; break;
+      case 0x6C: this.timerLatch[2] = this.timerCount[2]!; break;
+      // Timer 3 (RTC / event timer — no interrupt raised on expiry)
+      case 0x70: this.timerLatch[3] = (this.timerLatch[3]! & 0xFF00) | byte; break;
+      case 0x74: this.timerLatch[3] = (this.timerLatch[3]! & 0x00FF) | (byte << 8); break;
+      case 0x78: this.timerCount[3] = this.timerLatch[3]!; this.timerGo[3] = 1; break;
+      case 0x7C: this.timerLatch[3] = this.timerCount[3]!; break;
     }
   }
 
@@ -142,20 +175,17 @@ export class IOC {
   }
 
   raiseIRQA(bit: number): void {
-    this.irqAStatus  |= bit;
-    this.irqARequest |= bit;
+    this.irqAStatus |= bit;
     if (this.irqAStatus & this.irqAMask) this.onIRQ?.();
   }
 
   raiseIRQB(bit: number): void {
-    this.irqBStatus  |= bit;
-    this.irqBRequest |= bit;
+    this.irqBStatus |= bit;
     if (this.irqBStatus & this.irqBMask) this.onIRQ?.();
   }
 
   raiseFIQ(bit: number): void {
-    this.fiqStatus  |= bit;
-    this.fiqRequest |= bit;
+    this.fiqStatus |= bit;
     if (this.fiqStatus & this.fiqMask) this.onFIQ?.();
   }
 
@@ -177,11 +207,10 @@ export class IOC {
     this.control    = 0xFF;
     // Power-on reset: IRQA_POWER_ON is asserted so the ROM knows this is a
     // cold start rather than a soft reset.
-    this.irqAStatus  = IOC.IRQA_POWER_ON;
-    this.irqARequest = IOC.IRQA_POWER_ON;
-    this.irqAMask    = 0;
-    this.irqBStatus = this.irqBRequest = this.irqBMask = 0;
-    this.fiqStatus  = this.fiqRequest  = this.fiqMask  = 0;
+    this.irqAStatus = IOC.IRQA_POWER_ON;
+    this.irqAMask   = 0;
+    this.irqBStatus = this.irqBMask = 0;
+    this.fiqStatus  = this.fiqMask  = 0;
     this.timerLatch.fill(0);
     this.timerCount.fill(0);
     this.timerGo.fill(0);
