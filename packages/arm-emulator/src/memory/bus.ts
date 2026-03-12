@@ -89,6 +89,16 @@ export class SystemBus {
     let p = 1;
     while (p < size) p <<= 1;
     this.romMask = p - 1;
+    // Diagnostic: dump ROM bytes at key offsets
+    const hex32 = (off: number) => {
+      if (off + 3 >= this.rom.length) return '--------';
+      return ((this.rom[off]! | (this.rom[off+1]! << 8) | (this.rom[off+2]! << 16) | (this.rom[off+3]! << 24)) >>> 0).toString(16).padStart(8, '0');
+    };
+    const dump = (base: number, count: number) =>
+      Array.from({length: count}, (_, i) => `[${(base+i*4).toString(16)}]=${hex32(base+i*4)}`).join(' ');
+    console.log(`[BUS] ROM loaded: ${this.rom.length} bytes (mask=0x${this.romMask.toString(16)})`);
+    console.log(`[BUS] ROM[0x000..0x01C]: ${dump(0x000, 8)}`);
+    console.log(`[BUS] ROM[0x210..0x230]: ${dump(0x210, 9)}`);
   }
 
   /** Force-release the ROM alias (used by tests / machine reset). */
@@ -252,7 +262,22 @@ export class SystemBus {
     if (phys === null) {
       if (this._writeAbortCount < this._WRITE_ABORT_LIMIT) {
         this._writeAbortCount++;
-        console.debug(`[BUS] write ABORT logical=0x${logical.toString(16)} val=0x${value.toString(16)} (LPN=${logical >>> ((12 + ((this.memc.control >>> 2) & 3)))}, maxCAM=${128 >>> ((this.memc.control >>> 2) & 3)})`);
+        const s = this.memc.pageSizeIndex;
+        const lpn = logical >>> (12 + s);
+        console.debug(`[BUS] write ABORT logical=0x${logical.toString(16)} val=0x${value.toString(16)} (S=${s} LPN=${lpn} maxCAM=${this.memc.maxCamEntries})`);
+        if (this._writeAbortCount === 1) {
+          // Dump physical RAM at exception vector area (logical 0x0-0x1F → physical page 0)
+          const vec0phys = this.memc.translateAddress(0);
+          const vecS = this.memc.pageSizeIndex;
+          console.debug(`[BUS] ABORT CONTEXT: MEMC S=${vecS} pageSize=${4096<<vecS} rom_map_state=${this.romMapState}`);
+          if (vec0phys !== null) {
+            const base = vec0phys - PHYS_RAM_BASE;
+            const dump = Array.from({length:8}, (_,i) => `[${(i*4).toString(16)}]=0x${this.readRAM32(base+i*4).toString(16).padStart(8,'0')}`).join(' ');
+            console.debug(`[BUS] PhysRAM@vec_page(LPN=0→PPN=${(vec0phys-PHYS_RAM_BASE)>>>(12+vecS)} phys=0x${vec0phys.toString(16)}): ${dump}`);
+          } else {
+            console.debug(`[BUS] PhysRAM@vec: LPN=0 has NO CAM mapping!`);
+          }
+        }
       }
       this.onDataAbort?.();
       return;
@@ -273,6 +298,10 @@ export class SystemBus {
 
   private writeRAM32(offset: number, value: number): void {
     if (offset + 3 >= this.ram.length) return;
+    // Log writes to the exception vector page (phys 0x0-0xFF) — helps trace boot vector setup
+    if (offset < 0x100) {
+      console.debug(`[BUS] RAMwrite phys_off=0x${offset.toString(16).padStart(3,'0')} val=0x${(value>>>0).toString(16).padStart(8,'0')}`);
+    }
     this.ram[offset]     = value & 0xFF;
     this.ram[offset + 1] = (value >>> 8)  & 0xFF;
     this.ram[offset + 2] = (value >>> 16) & 0xFF;

@@ -151,6 +151,9 @@ export class ARM2CPU {
   }
 
   private _visitedPCs = new Set<number>();
+  private _moduleAreaWarned = false;
+  private _warnSummary = '';
+  private _pabortDebugged = false;
 
   private executeOne(): void {
     const instrAddr = this.regs.pc;
@@ -165,7 +168,14 @@ export class ARM2CPU {
 
     // Prefetch abort: instruction fetch from an unmapped logical address
     if (this.bus.readAborted) {
-      this.logger.debug(`[CPU] PABORT at 0x${instrAddr.toString(16)} R15=0x${(this.regs.r15>>>0).toString(16).padStart(8,'0')}`);
+      this.logger.debug(`[CPU] PABORT at 0x${instrAddr.toString(16)} R15=0x${(this.regs.r15>>>0).toString(16).padStart(8,'0')}${this._warnSummary ? ` [NV-block: ${this._warnSummary}]` : ''}`);
+      if (!this._pabortDebugged) {
+        this._pabortDebugged = true;
+        const regs = Array.from({length: 15}, (_, i) => `R${i}=0x${(this.regs.read(i)>>>0).toString(16)}`);
+        this.logger.debug(`[CPU] PABORT first-hit: ${regs.join(' ')} R15=0x${(this.regs.r15>>>0).toString(16)}`);
+        // eslint-disable-next-line no-debugger
+        debugger; // inspect why CPU is fetching from unmapped logical address
+      }
       this.takeException(VECTOR_PABORT, Mode.Supervisor);
       return;
     }
@@ -184,6 +194,15 @@ export class ARM2CPU {
         const regs = Array.from({length: 15}, (_, i) => `R${i}=0x${(this.regs.read(i)>>>0).toString(16)}`);
         this.logger.debug(`[CPU] DIAG@0x157C8 R10-check: ${regs.join(' ')} R15=0x${(this.regs.r15>>>0).toString(16)}`);
       }
+    }
+
+    // One-shot note: first time an 0xffffffff is fetched (part of the ARM3 NV-skip block in ROM).
+    // This is intentional — ARM2 silently skips NV-condition instructions.
+    if ((instr >>> 0) === 0xffffffff && !this._moduleAreaWarned) {
+      this._moduleAreaWarned = true;
+      const regs = Array.from({length: 15}, (_, i) => `R${i}=0x${(this.regs.read(i)>>>0).toString(16)}`);
+      this._warnSummary = `addr=0x${instrAddr.toString(16)} ${regs.join(' ')} R15=0x${(this.regs.r15>>>0).toString(16)}`;
+      this.logger.debug(`[CPU] NOTE: entering ARM3 NV-skip block at ${this._warnSummary}`);
     }
 
     const cond = (instr >>> 28) & 0xF;
@@ -232,6 +251,7 @@ export class ARM2CPU {
     if (!this.pcExplicit) {
       this.regs.pc = (instrAddr + 4) & PC_MASK;
     }
+
   }
 
   // ---------------------------------------------------------------------------
