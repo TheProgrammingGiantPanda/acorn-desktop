@@ -59,6 +59,12 @@ export interface NativeHost {
 
   /** Remove the iconbar entry */
   removeIconbarEntry(taskHandle: number): void;
+
+  /**
+   * Push raw RGBA pixel data captured from the VIDC frame buffer into a
+   * window's canvas.  Called at the end of each Wimp redraw loop.
+   */
+  updateWindowPixels(handle: number, pixels: Uint8ClampedArray, width: number, height: number): void;
 }
 
 export interface NativeMenuItem {

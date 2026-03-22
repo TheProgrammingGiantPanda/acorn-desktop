@@ -24,6 +24,7 @@ export const OS_Exit         = 0x000011;
 export const OS_IntOn        = 0x000013;
 export const OS_IntOff       = 0x000014;
 export const OS_FSControl    = 0x000019;
+export const OS_ServiceCall  = 0x000030;
 export const OS_ReadVarVal   = 0x000023;
 export const OS_SetVarVal    = 0x000024;
 export const OS_Heap         = 0x00001D;

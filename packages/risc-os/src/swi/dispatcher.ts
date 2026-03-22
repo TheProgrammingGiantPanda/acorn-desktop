@@ -34,6 +34,11 @@ export interface DispatcherOptions {
   fs?: FileSystemHost;
   /** Called when an Obey Run command targets an ARM binary */
   onRunBinary?: (riscosPath: string) => void;
+  /**
+   * Called when Service_StartFiler (&4D) is broadcast — the Filer has started
+   * and modules should add their disc icons to the iconbar.
+   */
+  onServiceStartFiler?: () => void;
 }
 
 export class SwiDispatcher {
@@ -59,10 +64,10 @@ export class SwiDispatcher {
       spritePool:  this.spriteAreas.system,
       modules:     this.modules,
     });
-    this.registerAll(options.onOutput ?? (() => {}), options.fs);
+    this.registerAll(options.onOutput ?? (() => {}), options.fs, options);
   }
 
-  private registerAll(output: OutputCallback, fs?: FileSystemHost): void {
+  private registerAll(output: OutputCallback, fs?: FileSystemHost, options: DispatcherOptions = {}): void {
     const m = this.machine;
     const cpu = m.cpu;
 
@@ -79,16 +84,24 @@ export class SwiDispatcher {
     cpu.swiHandlers.set(SWI.OS_Mouse,        os.OS_Mouse);
     cpu.swiHandlers.set(SWI.OS_ReadModeVar,  os.OS_ReadModeVar);
     cpu.swiHandlers.set(SWI.OS_Heap,         os.OS_Heap);
-    cpu.swiHandlers.set(SWI.OS_Module,       os.OS_Module);
     cpu.swiHandlers.set(SWI.OS_WriteN,       os.OS_WriteN);
+
+    // OS_ServiceCall (SWI &30): intercept Service_StartFiler then pass to ROM
+    cpu.swiHandlers.set(SWI.OS_ServiceCall, (regs) => {
+      const service = regs.read(1) >>> 0;
+      // Service_StartFiler = 0x4D: Filer is starting, modules should add disc icons
+      if (service === 0x4D) {
+        options.onServiceStartFiler?.();
+      }
+      return 'passthrough'; // Always let ROM dispatch to modules too
+    });
 
     // ── System variables ──────────────────────────────────────────────────────
     const { sysvar, obey } = this;
 
-    cpu.swiHandlers.set(SWI.OS_CLI, (regs, bus) => {
-      const cmd = readCString(bus, regs.read(0));
-      obey.executeLine(cmd);
-    });
+    // OS_CLI: passthrough to ROM — the ROM's CLI handler interprets *commands,
+    // Obey scripts, and ARM binaries natively.  We must not intercept it here
+    // or we shadow the ROM's own command processing in ROM boot mode.
 
     cpu.swiHandlers.set(SWI.OS_ReadVarVal, (regs, bus) => {
       const name  = readCString(bus, regs.read(0));
@@ -162,6 +175,7 @@ export class SwiDispatcher {
 
     cpu.swiHandlers.set(SWI.Wimp_RedrawWindow,    (r, b) => w.redrawWindow(r, b));
     cpu.swiHandlers.set(SWI.Wimp_UpdateWindow,    (r, b) => w.redrawWindow(r, b));
+    cpu.swiHandlers.set(SWI.Wimp_GetRectangle,    (r, b) => w.getWindowRect(r, b));
     cpu.swiHandlers.set(SWI.Wimp_GetWindowState,  (r, b) => w.getWindowState(r, b));
     cpu.swiHandlers.set(SWI.Wimp_ForceRedraw,     (r, b) => w.forceRedraw(r, b));
     cpu.swiHandlers.set(SWI.Wimp_CreateIcon,      (r, b) => w.createIcon(r, b));
@@ -182,20 +196,10 @@ export class SwiDispatcher {
     cpu.swiHandlers.set(SWI.OS_SpriteOp,  (r, b) => spriteHandler.handleOS(r, b));
     cpu.swiHandlers.set(SWI.Wimp_SpriteOp,(r, b) => spriteHandler.handleWimp(r, b));
 
-    // Stubs for less critical SWIs — acknowledge without doing anything
-    const stub = () => {};
-    for (const n of [
-      SWI.Wimp_GetWindowInfo, SWI.Wimp_SetIconState, SWI.Wimp_GetIconState,
-      SWI.Wimp_DragBox, SWI.Wimp_SetCaretPosition, SWI.Wimp_GetCaretPosition,
-      SWI.Wimp_DecodeMenu, SWI.Wimp_WhichIcon, SWI.Wimp_SetExtent,
-      SWI.Wimp_SetPointerShape, SWI.Wimp_OpenTemplate, SWI.Wimp_CloseTemplate,
-      SWI.Wimp_LoadTemplate, SWI.Wimp_ProcessKey, SWI.Wimp_StartTask,
-      SWI.Wimp_GetWindowOutline, SWI.Wimp_PlotIcon, SWI.Wimp_SetMode,
-      SWI.Wimp_CreateSubMenu, SWI.Wimp_SetFontColours,
-      SWI.Wimp_GetMenuState, SWI.Wimp_TextColour,
-    ]) {
-      cpu.swiHandlers.set(n, stub);
-    }
+    // All remaining Wimp_* SWIs passthrough to ROM.
+    // The ROM's Wimp handles GetWindowInfo, SetIconState, ProcessKey, SetExtent,
+    // SetMode, etc. correctly.  No-op stubs were actively harmful — they
+    // returned zeroed registers where apps expected real data.
 
     // ── File system ───────────────────────────────────────────────────────────
     if (fs) {
@@ -209,13 +213,7 @@ export class SwiDispatcher {
       cpu.swiHandlers.set(SWI.OS_FSControl, (r, b) => fsHandler.fsControl(r, b));
     }
 
-    // Font stubs
-    for (const n of [
-      SWI.Font_FindFont, SWI.Font_LoseFont, SWI.Font_Paint,
-      SWI.Font_StringWidth, SWI.Font_SetFontColours,
-    ]) {
-      cpu.swiHandlers.set(n, stub);
-    }
+    // Font_* SWIs passthrough to ROM — the ROM's font manager handles them.
 
   }
 

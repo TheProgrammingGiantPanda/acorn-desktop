@@ -69,18 +69,18 @@ export const IPC = {
   ERROR: "emulator:error",
   FRAME_READY: "emulator:frame-ready",
 
-  // Programs browser
-  BROWSER_LIST_APPS:   "browser:list-apps",
-  BROWSER_LAUNCH_APP:  "browser:launch-app",
-  BROWSER_INSTALL_APP: "browser:install-app",
-  BROWSER_REFRESH:     "browser:refresh",
+  // HostFS browser
+  HOSTFS_LIST_DIR:  "hostfs:list-dir",
+  HOSTFS_LAUNCH:    "hostfs:launch",
+  HOSTFS_OPEN_DIR:  "hostfs:open-dir",
 } as const;
 
 export type IpcChannel = (typeof IPC)[keyof typeof IPC];
 
-export interface AppEntry {
-  name:        string;   // e.g. "!SciCalc"
-  displayName: string;   // e.g. "SciCalc"
+export interface DirEntry {
+  name:   string;   // bare filename, e.g. "!SciCalc" or "Documents"
+  isDir:  boolean;
+  isApp:  boolean;  // starts with "!"
   sprite?: {
     rgba:   number[];  // flat RGBA Uint8ClampedArray serialised as plain array
     width:  number;

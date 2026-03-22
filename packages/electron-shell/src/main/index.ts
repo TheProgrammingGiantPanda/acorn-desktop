@@ -13,12 +13,16 @@ import { SwiDispatcher, ObeyInterpreter, SpritePool } from "@theprogramminggiant
 import { NativeWimpHost } from "./native-wimp-host.js";
 import { NodeFsHost } from "./node-fs-host.js";
 import { HostFsHandler } from "./hostfs-handler.js";
+import { generateHostFsModule, MODULE_INIT_OFFSET, MODULE_SENTINEL_SWI } from "./hostfs-arm-module.js";
 import { buildAppMenu } from "./menu.js";
-import type { MachineConfig, AppEntry } from "@theprogramminggiantpanda/shared";
+import type { MachineConfig, DirEntry } from "@theprogramminggiantpanda/shared";
 import { IPC, Logger } from "@theprogramminggiantpanda/shared";
 
 const isDev = !app.isPackaged;
 const logger = new Logger(isDev ? 'debug' : 'error');
+
+// Special iconbar handle for the HostFS disc icon (-999 won't collide with task handles)
+const HOSTFS_ICONBAR_HANDLE = -999;
 
 // ---------------------------------------------------------------------------
 // Asset path resolution
@@ -80,8 +84,37 @@ function createLauncherWindow(): BrowserWindow {
   return win;
 }
 
-let launcherWindow:        BrowserWindow | null = null;
-let programsBrowserWindow: BrowserWindow | null = null;
+let launcherWindow: BrowserWindow | null = null;
+
+// ---------------------------------------------------------------------------
+// HostFS browser window
+// ---------------------------------------------------------------------------
+function createHostFsBrowserWindow(riscosPath: string): BrowserWindow {
+  const encodedPath = encodeURIComponent(riscosPath);
+  const win = new BrowserWindow({
+    width:    480,
+    height:   400,
+    minWidth: 320,
+    minHeight: 200,
+    title:    `HostFS: ${riscosPath}`,
+    webPreferences: {
+      preload: path.join(__dirname, "../preload/hostfs-browser-preload.js"),
+      contextIsolation: true,
+      nodeIntegration: false,
+    },
+  });
+
+  if (isDev) {
+    win.loadURL(`http://localhost:5173/hostfs-browser.html?path=${encodedPath}`);
+  } else {
+    win.loadFile(
+      path.join(__dirname, "../../renderer/hostfs-browser.html"),
+      { query: { path: riscosPath } },
+    );
+  }
+
+  return win;
+}
 
 // ---------------------------------------------------------------------------
 // Boot sequence: run !Boot for every app in assets/programs/
@@ -133,69 +166,61 @@ function bootAllApps(): void {
 }
 
 // ---------------------------------------------------------------------------
-// Programs browser window
+// List HostFS directory contents for the browser
 // ---------------------------------------------------------------------------
-function createProgramsBrowserWindow(): BrowserWindow {
-  const win = new BrowserWindow({
-    width:       480,
-    height:      400,
-    minWidth:    320,
-    minHeight:   200,
-    title:       "Programs",
-    webPreferences: {
-      preload: path.join(__dirname, "../preload/programs-browser-preload.js"),
-      contextIsolation: true,
-      nodeIntegration: false,
-    },
-  });
+function listDir(riscosPath: string): DirEntry[] {
+  const programsDir = resolveAssets("assets", "programs");
 
-  if (isDev) {
-    win.loadURL("http://localhost:5173/programs-browser.html");
-    win.webContents.once("did-finish-load", () => win.webContents.openDevTools({ mode: "bottom" }));
+  // Resolve HostFS::$ → programsDir; HostFS::$.Dir.Sub → programsDir/Dir/Sub
+  let nativePath: string;
+  if (riscosPath === "HostFS::$" || riscosPath === "HostFS::$.") {
+    nativePath = programsDir;
+  } else if (riscosPath.startsWith("HostFS::$.")) {
+    const inner = riscosPath.slice("HostFS::$.".length);
+    nativePath = path.join(programsDir, ...inner.split("."));
   } else {
-    win.loadFile(path.join(__dirname, "../../renderer/programs-browser.html"));
+    return [];
   }
 
-  win.on("closed", () => { programsBrowserWindow = null; });
-  return win;
-}
-
-/** Scan assets/programs/ and build the app list with decoded sprites. */
-function listApps(): AppEntry[] {
-  const programsDir = resolveAssets("assets", "programs");
   let entries: string[] = [];
-  try { entries = fs.readdirSync(programsDir); } catch { return []; }
+  try { entries = fs.readdirSync(nativePath).sort(); }
+  catch { return []; }
 
   return entries
-    .filter(name => name.startsWith("!"))
     .filter(name => {
-      try { return fs.statSync(path.join(programsDir, name)).isDirectory(); }
+      try { fs.statSync(path.join(nativePath, name)); return true; }
       catch { return false; }
     })
-    .sort()
-    .map((name): AppEntry => {
-      const displayName = name.slice(1); // strip leading "!"
-      const spriteName  = displayName.toLowerCase();
-      const spritePath  = path.join(programsDir, name, "!Sprites");
-      let sprite: AppEntry["sprite"] | undefined;
+    .map((name): DirEntry => {
+      const entryPath = path.join(nativePath, name);
+      let stat: fs.Stats;
+      try { stat = fs.statSync(entryPath); }
+      catch { return { name, isDir: false, isApp: false }; }
 
-      try {
-        const data = fs.readFileSync(spritePath);
-        const pool = new SpritePool();
-        pool.loadArea(new Uint8Array(data));
+      const isDir = stat.isDirectory();
+      const isApp = name.startsWith("!");
+      let sprite: DirEntry["sprite"] | undefined;
 
-        // Try "!name" first (RISC OS convention), then plain "name"
-        const found = pool.get(`!${spriteName}`) ?? pool.get(spriteName);
-        if (found) {
-          sprite = {
-            rgba:   Array.from(found.rgba),
-            width:  found.width,
-            height: found.height,
-          };
-        }
-      } catch { /* no !Sprites or parse error — use generic icon */ }
+      if (isDir && isApp) {
+        // Try loading the sprite for !App directories
+        const spriteName  = name.slice(1).toLowerCase();
+        const spritePath  = path.join(entryPath, "!Sprites");
+        try {
+          const data = fs.readFileSync(spritePath);
+          const pool = new SpritePool();
+          pool.loadArea(new Uint8Array(data));
+          const found = pool.get(`!${spriteName}`) ?? pool.get(spriteName);
+          if (found) {
+            sprite = {
+              rgba:   Array.from(found.rgba),
+              width:  found.width,
+              height: found.height,
+            };
+          }
+        } catch { /* no !Sprites or parse error — use generic icon */ }
+      }
 
-      return { name, displayName, sprite };
+      return { name, isDir, isApp, sprite };
     });
 }
 
@@ -207,8 +232,7 @@ function startMachine(romData: Uint8Array, appHostPath?: string): void {
 
   // When launching a specific app, root the FS at the app's parent directory
   // so the app dir is accessible as $.!AppName inside RISC OS.
-  // In programs-browser mode (no appHostPath), root at assets/programs/ so
-  // dispatcher.obey.runFile("$.!AppName.!Run") resolves correctly.
+  // In HostFS browser mode (no appHostPath), root at assets/programs/.
   const fsRoot = appHostPath
     ? path.dirname(path.resolve(appHostPath))
     : resolveAssets("assets", "programs");
@@ -217,32 +241,18 @@ function startMachine(romData: Uint8Array, appHostPath?: string): void {
 
   machine    = new ArchimedesMachine(config, logger);
   wimpHost   = new NativeWimpHost();
-  // obeyFs gives the ObeyInterpreter access to !Run / !Boot scripts on disk.
-  // fs is intentionally omitted: in ROM boot mode the real ROM FileSwitch
-  // handles OS_File / OS_Find / etc.; HostFsHandler (registered below)
-  // intercepts only HostFS:: paths and passes everything else through to ROM.
+
+  // obeyFs is used only for bootAllApps() pre-boot !Boot scripts.
+  // In ROM boot mode the real ROM CLI/FileSwitch handles all app launching.
   dispatcher = new SwiDispatcher(machine, wimpHost, {
     onOutput: (text) => {
       logger.debug(`[RISC OS] ${text}`);
       launcherWindow?.webContents.send("console-output", text);
     },
     obeyFs: nodeFs,
-    onRunBinary: (riscosPath) => {
-      logger.debug(`[onRunBinary] loading: ${riscosPath}`);
-      try {
-        const data = nodeFs.readFile(riscosPath);
-        logger.debug(`[onRunBinary] binary size: ${data.length} bytes — starting app`);
-        // SWI 0xADBEEF is the AIF "not yet decompressed" guard — halt cleanly.
-        machine!.cpu.swiHandlers.set(0xADBEEF, () => {
-          logger.debug(`[AIF] decompressor guard SWI — binary not decompressed correctly`);
-          machine!.cpu.halted = true;
-        });
-        machine!.startApp(data);
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        logger.error(`[onRunBinary] failed: ${msg}`);
-        launcherWindow?.webContents.send(IPC.ERROR, { message: `Cannot run ${riscosPath}: ${msg}`, fatal: false });
-      }
+    onServiceStartFiler: () => {
+      logger.debug(`[HostFS] Service_StartFiler received — adding iconbar disc icon`);
+      wimpHost?.setIconbarEntry(HOSTFS_ICONBAR_HANDLE, "hostfsdisk", "HostFS::$");
     },
   });
 
@@ -254,71 +264,83 @@ function startMachine(romData: Uint8Array, appHostPath?: string): void {
   machine.loadROM(romData);
   machine.bootROM();
 
+  // ── ARM module integration ────────────────────────────────────────────────
+  // Write the HostFS ARM module binary into physical RAM at 0x80000.
+  // In the emulator's linear mapping, logical 0x80000 = physical 0x80000.
+  const MODULE_BASE   = 0x80000;
+  const moduleBinary  = generateHostFsModule(MODULE_BASE);
+  machine.writePhysical(MODULE_BASE, moduleBinary);
+
+  // Register private SWIs that the module stubs delegate to
+  hostfs.registerPrivateSWIs(machine);
+
+  // Register SWI 0x041509 — service entry callback (add iconbar icon)
+  machine.cpu.swiHandlers.set(0x041509, () => {
+    logger.debug(`[HostFS] ARM module service callback — adding iconbar disc icon`);
+    wimpHost?.setIconbarEntry(HOSTFS_ICONBAR_HANDLE, "hostfsdisk", "HostFS::$");
+  });
+
+  // One-shot hook on first Wimp_Poll to run the module init ARM routine.
+  // This registers HostFS with FileSwitch via OS_FSControl 12 (which passthroughs
+  // to the real ROM), then fires MODULE_SENTINEL_SWI to signal completion.
+  let moduleInitDone = false;
+  const origPollHandler = machine.cpu.swiHandlers.get(0x400C7); // Wimp_Poll
+  machine.cpu.swiHandlers.set(0x400C7, (r, b) => {
+    if (!moduleInitDone) {
+      moduleInitDone = true;
+      machine!.cpu.swiPending = true;
+      machine!.runArmCallback(MODULE_BASE + MODULE_INIT_OFFSET, MODULE_SENTINEL_SWI)
+        .then(() => {
+          logger.debug(`[HostFS] Module init complete`);
+          // Restore original Wimp_Poll handler and resume
+          if (origPollHandler) {
+            machine!.cpu.swiHandlers.set(0x400C7, origPollHandler);
+          } else {
+            machine!.cpu.swiHandlers.delete(0x400C7);
+          }
+          void dispatcher!.wimp.poll(r, b, false);
+        })
+        .catch(err => {
+          logger.error(`[HostFS] Module init failed: ${err}`);
+          if (origPollHandler) {
+            machine!.cpu.swiHandlers.set(0x400C7, origPollHandler);
+          } else {
+            machine!.cpu.swiHandlers.delete(0x400C7);
+          }
+          void dispatcher!.wimp.poll(r, b, false);
+        });
+      return; // CPU suspended — don't call poll yet
+    }
+    origPollHandler?.(r, b);
+  });
+
+  // Fallback: add iconbar icon after a delay in case Service_StartFiler
+  // is not broadcast (e.g. ROM doesn't have Filer)
+  setTimeout(() => {
+    if (wimpHost && !wimpHost["iconbarEntries"]?.has(HOSTFS_ICONBAR_HANDLE)) {
+      logger.debug(`[HostFS] Fallback — adding iconbar disc icon`);
+      wimpHost.setIconbarEntry(HOSTFS_ICONBAR_HANDLE, "hostfsdisk", "HostFS::$");
+    }
+  }, 3000);
+
   bootAllApps();
 
   if (appHostPath) {
-    launchApp(nodeFs, appHostPath);
-  } else {
-    // No specific app — open the programs browser
-    if (!programsBrowserWindow || programsBrowserWindow.isDestroyed()) {
-      programsBrowserWindow = createProgramsBrowserWindow();
-    } else {
-      programsBrowserWindow.focus();
-    }
+    // Defer launch until after the ROM has booted and the CPU is suspended in
+    // Wimp_Poll.  We reuse the same 3-second window as the iconbar fallback.
+    const appName = path.basename(path.resolve(appHostPath));
+    setTimeout(() => {
+      logger.debug(`[CLI] launching via ROM CLI: Run HostFS::$.${appName}.!Run`);
+      machine?.execCLI(`Run HostFS::$.${appName}.!Run`);
+    }, 3500);
   }
+  // No specific app — just boot the ROM and wait for the Filer to start.
+  // The Service_StartFiler callback (or the fallback timer) will add the icon.
 
-  launcherWindow?.webContents.send("machine-started", { model: config.model });
-}
-
-// ---------------------------------------------------------------------------
-// App launch (CLI)
-// ---------------------------------------------------------------------------
-function launchApp(nodeFs: NodeFsHost, hostPath: string): void {
-  const resolved = path.resolve(hostPath);
-
-  if (!fs.existsSync(resolved)) {
-    launcherWindow?.webContents.send(IPC.ERROR, {
-      message: `App path not found: ${hostPath}`,
-      fatal: false,
-    });
-    return;
-  }
-
-  const stat = fs.statSync(resolved);
-
-  if (stat.isDirectory()) {
-    const appName   = path.basename(resolved);          // e.g. "!Paint"
-
-    if (!appName.startsWith("!")) {
-      launcherWindow?.webContents.send(IPC.ERROR, {
-        message: `App directory name must start with '!': ${appName}`,
-        fatal: false,
-      });
-      return;
-    }
-
-    const runScript = `$.${appName}.!Run`;              // e.g. "$.!Paint.!Run"
-
-    if (nodeFs.stat(runScript) !== null) {
-      // Normal RISC OS app: run the !Run Obey script
-      dispatcher!.obey.runFile(runScript);
-    } else {
-      // No !Run — try !RunImage as a raw binary
-      const riscosRunImage = `$.${appName}.!RunImage`;
-      if (nodeFs.stat(riscosRunImage) !== null) {
-        machine!.loadProgram(nodeFs.readFile(riscosRunImage));
-      } else {
-        launcherWindow?.webContents.send(IPC.ERROR, {
-          message: `No !Run or !RunImage found in: ${hostPath}`,
-          fatal: false,
-        });
-      }
-    }
-  } else {
-    // Raw binary file — load it directly at 0x8000
-    const data = fs.readFileSync(resolved);
-    machine!.loadProgram(new Uint8Array(data));
-  }
+  // Hide the launcher now that the ROM is running — the Filer provides the UI.
+  // (We keep it hidden rather than closed so the app process stays alive while
+  // RISC OS boots and opens its own windows.)
+  launcherWindow?.hide();
 }
 
 // ---------------------------------------------------------------------------
@@ -381,83 +403,48 @@ ipcMain.handle(IPC.LOAD_ROM,  async (_ev, payload: { path: string }) => {
 });
 
 // ---------------------------------------------------------------------------
-// Programs browser IPC
+// HostFS browser IPC
 // ---------------------------------------------------------------------------
-ipcMain.handle(IPC.BROWSER_LIST_APPS, (): AppEntry[] => {
+ipcMain.handle(IPC.HOSTFS_LIST_DIR, (_ev, riscosPath: string): DirEntry[] => {
   try {
-    return listApps();
+    return listDir(riscosPath);
   } catch (err) {
-    logger.error(`[browser:list-apps] ${err}`);
+    logger.error(`[hostfs:list-dir] ${err}`);
     return [];
   }
 });
 
-ipcMain.handle(IPC.BROWSER_LAUNCH_APP, (_ev, appName: string) => {
-  logger.debug(`[launch] ${appName}`);
-  const programsDir = resolveAssets("assets", "programs");
-  const appHostPath = path.join(programsDir, appName);
-
-  if (!fs.existsSync(appHostPath)) { logger.error(`[launch] path not found: ${appHostPath}`); return; }
-  if (!dispatcher) { logger.error(`[launch] dispatcher not ready`); return; }
-
-  const programsFs = new NodeFsHost(programsDir);
-  const runScript  = `$.${appName}.!Run`;
-
-  if (programsFs.stat(runScript) !== null) {
-    logger.debug(`[launch] running obey: ${runScript}`);
-    dispatcher.obey.runFile(runScript);
-  } else {
-    const runImage = `$.${appName}.!RunImage`;
-    logger.debug(`[launch] no !Run, trying binary: ${runImage}`);
-    if (programsFs.stat(runImage) !== null) {
-      const data = programsFs.readFile(runImage);
-      machine!.startApp(data);
-    } else {
-      logger.error(`[launch] no !Run or !RunImage found in ${appName}`);
-    }
+ipcMain.handle(IPC.HOSTFS_LAUNCH, (_ev, riscosPath: string) => {
+  logger.debug(`[hostfs:launch] ${riscosPath}`);
+  if (!machine) {
+    logger.error(`[hostfs:launch] machine not ready`);
+    return;
   }
+
+  // Ensure the path is fully qualified with the HostFS:: prefix so the ROM's
+  // FileSwitch can route it to our registered filing system.
+  const fullPath = riscosPath.startsWith("HostFS::") ? riscosPath : `HostFS::${riscosPath}`;
+  logger.debug(`[hostfs:launch] ROM CLI: Run ${fullPath}.!Run`);
+
+  // Delegate entirely to the ROM's CLI handler — it knows how to interpret
+  // Obey scripts, handle *FX / *IfThere / *RMLoad etc., and load ARM binaries.
+  machine.execCLI(`Run ${fullPath}.!Run`);
 });
 
-ipcMain.handle(IPC.BROWSER_INSTALL_APP, async (_ev, hostPath: string): Promise<{ ok: boolean; error?: string }> => {
-  try {
-    const name = path.basename(hostPath);
-    if (!name.startsWith("!")) {
-      return { ok: false, error: `Directory name must start with '!': ${name}` };
-    }
+ipcMain.handle(IPC.HOSTFS_OPEN_DIR, (_ev, riscosPath: string) => {
+  logger.debug(`[hostfs:open-dir] ${riscosPath}`);
+  createHostFsBrowserWindow(riscosPath);
+});
 
-    const stat = fs.statSync(hostPath);
-    if (!stat.isDirectory()) {
-      return { ok: false, error: "Only !App directories can be installed" };
-    }
-
-    const programsDir = resolveAssets("assets", "programs");
-    const destDir     = path.join(programsDir, name);
-    fs.cpSync(hostPath, destDir, { recursive: true });
-
-    // Run !Boot for the newly installed app
-    if (dispatcher) {
-      const programsFs = new NodeFsHost(programsDir);
-      const bootPath   = `$.${name}.!Boot`;
-      const spritePath = `$.${name}.!Sprites`;
-
-      if (programsFs.stat(bootPath) !== null) {
-        const obey = new ObeyInterpreter(programsFs, dispatcher.sysvar, {
-          onOutput: (text) => launcherWindow?.webContents.send("console-output", text),
-          spritePool: dispatcher.spriteAreas.system,
-        });
-        obey.runFile(bootPath);
-      } else if (programsFs.stat(spritePath) !== null) {
-        try {
-          dispatcher.spriteAreas.system.loadArea(programsFs.readFile(spritePath));
-        } catch { /* ignore */ }
-      }
-    }
-
-    // Tell the browser window to refresh
-    programsBrowserWindow?.webContents.send(IPC.BROWSER_REFRESH);
-    return { ok: true };
-  } catch (err) {
-    return { ok: false, error: String(err) };
+// ---------------------------------------------------------------------------
+// Iconbar click → open HostFS browser
+// ---------------------------------------------------------------------------
+// Listen for iconbar-click in main process to intercept HOSTFS_ICONBAR_HANDLE.
+// NativeWimpHost also listens for this event, so it will forward other handles
+// to RISC OS tasks normally.
+ipcMain.on("iconbar-click", (_ev, { taskHandle }: { taskHandle: number; buttons: number }) => {
+  if (taskHandle === HOSTFS_ICONBAR_HANDLE) {
+    createHostFsBrowserWindow("HostFS::$");
   }
 });
 
@@ -502,25 +489,15 @@ function tryAutoLoadROM(): void {
 app.whenReady().then(() => {
   Menu.setApplicationMenu(buildAppMenu(null, { onLoadROM, onReset, onSetSpeed, onSetCPU }));
 
-  if (parseAppArg()) {
-    // Launching a specific app: show launcher window for status/error feedback
-    launcherWindow = createLauncherWindow();
-    launcherWindow.on("closed", () => { launcherWindow = null; });
-    launcherWindow.webContents.once("did-finish-load", tryAutoLoadROM);
-  } else {
-    // No specific app: go straight to programs browser, no launcher needed
-    tryAutoLoadROM();
-  }
+  launcherWindow = createLauncherWindow();
+  launcherWindow.on("closed", () => { launcherWindow = null; });
+  launcherWindow.webContents.once("did-finish-load", tryAutoLoadROM);
 
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) {
-      if (parseAppArg()) {
-        launcherWindow = createLauncherWindow();
-        launcherWindow.on("closed", () => { launcherWindow = null; });
-        launcherWindow.webContents.once("did-finish-load", tryAutoLoadROM);
-      } else {
-        programsBrowserWindow = createProgramsBrowserWindow();
-      }
+      launcherWindow = createLauncherWindow();
+      launcherWindow.on("closed", () => { launcherWindow = null; });
+      launcherWindow.webContents.once("did-finish-load", tryAutoLoadROM);
     }
   });
 });
