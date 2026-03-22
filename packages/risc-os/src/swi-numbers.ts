@@ -24,6 +24,7 @@ export const OS_Exit         = 0x000011;
 export const OS_IntOn        = 0x000013;
 export const OS_IntOff       = 0x000014;
 export const OS_FSControl    = 0x000019;
+export const OS_ServiceCall  = 0x000030;
 export const OS_ReadVarVal   = 0x000023;
 export const OS_SetVarVal    = 0x000024;
 export const OS_Heap         = 0x00001D;
@@ -43,6 +44,7 @@ export const OS_ValidateAddress = 0x000003A;
 export const OS_CallASWI     = 0x00006F;
 export const OS_CallASWIR12  = 0x000071;
 export const OS_PlatformFeatures = 0x06D;
+export const OS_SetColour        = 0x000061;
 
 // Wimp SWIs
 export const Wimp_Initialise      = 0x400C0;

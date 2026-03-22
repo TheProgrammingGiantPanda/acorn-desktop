@@ -10,18 +10,20 @@ import { ARM2CPU, type SwiHandler, type CpuVariant } from "./cpu/arm2.js";
 import { SystemBus } from "./memory/bus.js";
 import { MEMC } from "./chips/memc.js";
 import { IOC }  from "./chips/ioc.js";
+import { VIDC } from "./chips/vidc.js";
 import type { MachineConfig } from "@theprogramminggiantpanda/shared";
 import { Logger } from "@theprogramminggiantpanda/shared";
 
 const ARM2_CLOCK_HZ = 8_000_000;
 const ARM3_CLOCK_HZ = 25_000_000;
-const STEPS_PER_TICK = 10_000; // instructions per setTimeout slice
+const STEPS_PER_TICK = 100_000; // instructions per setTimeout slice
 
 export class ArchimedesMachine {
-  readonly cpu: ARM2CPU;
-  readonly bus: SystemBus;
+  readonly cpu:  ARM2CPU;
+  readonly bus:  SystemBus;
   readonly memc: MEMC;
   readonly ioc:  IOC;
+  readonly vidc: VIDC;
 
   private running  = false;
   private paused   = false;
@@ -43,16 +45,8 @@ export class ArchimedesMachine {
     this.memc = new MEMC();
     this.ioc  = new IOC();
 
-    // VIDC stub — satisfies bus constructor but does nothing (no hardware rendering)
-    const vidcStub = {
-      write: () => {},
-      displayWidth:  640,
-      displayHeight: 512,
-      bpp:           4 as 4,
-      renderFrame:   () => {},
-    } as unknown as import("./chips/vidc.js").VIDC;
-
-    this.bus = new SystemBus(config.ramSize, vidcStub, this.memc, this.ioc);
+    this.vidc = new VIDC();
+    this.bus = new SystemBus(config.ramSize, this.vidc, this.memc, this.ioc);
     this.cpu = new ARM2CPU(this.bus, config.cpuVariant as CpuVariant, logger);
 
     this.ioc.onIRQ = () => this.cpu.triggerIRQ();
@@ -97,6 +91,124 @@ export class ArchimedesMachine {
     ]));
 
     this.bus.dmaWrite(addr, data);
+  }
+
+  /**
+   * Write data to physical RAM at the given offset (bypassing MEMC).
+   * The data will be accessible at the same logical address when that logical
+   * address >= 0x80000 (in the emulator's linear-mapped region).
+   */
+  writePhysical(physOffset: number, data: Uint8Array): void {
+    this.bus.dmaWrite(physOffset, data);
+  }
+
+  /**
+   * Capture the VIDC frame buffer and extract the rectangular region that
+   * corresponds to a RISC OS window's visible area.
+   *
+   * @param osX0/osY0/osX1/osY1  Window visible area in OS units (Y increases upward)
+   * @returns RGBA pixel data + dimensions, or null if the screen isn't set up yet
+   */
+  captureWindowRegion(
+    osX0: number, osY0: number, osX1: number, osY1: number,
+  ): { pixels: Uint8ClampedArray; width: number; height: number } | null {
+    const sw = this.vidc.displayWidth;
+    const sh = this.vidc.displayHeight;
+    if (sw <= 0 || sh <= 0) return null;
+
+    const bpp      = this.vidc.bpp;
+    const frameLen = Math.ceil(sw * sh * bpp / 8);
+    const screenRAM = this.bus.dmaRead(this.memc.videoDMAStart, frameLen);
+
+    const fullRGBA = new Uint8ClampedArray(sw * sh * 4);
+    this.vidc.renderFrame(screenRAM, fullRGBA);
+
+    // OS units → pixels  (typically 2 OS units = 1 pixel)
+    const px0 = Math.max(0, Math.min(sw, Math.round(osX0 / 2)));
+    const px1 = Math.max(0, Math.min(sw, Math.round(osX1 / 2)));
+    // RISC OS Y increases upward; frame buffer Y=0 is at the top
+    const py0 = Math.max(0, Math.min(sh, sh - Math.round(osY1 / 2)));
+    const py1 = Math.max(0, Math.min(sh, sh - Math.round(osY0 / 2)));
+
+    const rw = px1 - px0;
+    const rh = py1 - py0;
+    if (rw <= 0 || rh <= 0) return null;
+
+    const pixels = new Uint8ClampedArray(rw * rh * 4);
+    for (let y = 0; y < rh; y++) {
+      const srcOff = ((py0 + y) * sw + px0) * 4;
+      pixels.set(fullRGBA.subarray(srcOff, srcOff + rw * 4), y * rw * 4);
+    }
+    return { pixels, width: rw, height: rh };
+  }
+
+  /**
+   * Execute a RISC OS CLI command via the ROM's own CLI handler.
+   *
+   * Writes a tiny ARM stub + null-terminated command string to a scratch area
+   * in RAM (0x7E000) and wakes the CPU to execute it.  The stub calls
+   * SWI OS_CLI which passthroughs to ROM — the ROM's Obey interpreter handles
+   * *commands, !Run scripts, and ARM binaries natively.
+   *
+   * The CPU must be suspended (swiPending = true) before calling this method,
+   * which is the normal state while the Wimp desktop is idle in Wimp_Poll.
+   */
+  execCLI(command: string): void {
+    if (!this.cpu.swiPending) return; // CPU is running — cannot safely inject
+
+    const SCRATCH = 0x7E000; // scratch area just below the HostFS module
+    const enc = new TextEncoder().encode(command + '\0');
+    const stub = new Uint8Array(12 + enc.length);
+    const view = new DataView(stub.buffer);
+
+    // ADD R0, PC, #4  — when this executes, PC = SCRATCH+8, so R0 = SCRATCH+12
+    view.setUint32(0, 0xE28F0004, true);
+    // SWI OS_CLI (0x05) — passthroughs to ROM in ROM boot mode
+    view.setUint32(4, 0xEF000005, true);
+    // B . — infinite loop / halt if OS_CLI ever returns (e.g. non-Wimp command)
+    view.setUint32(8, 0xEAFFFFFE, true);
+    stub.set(enc, 12);
+
+    this.bus.dmaWrite(SCRATCH, stub);
+    // Point LR at the halt so unexpected returns land safely
+    this.cpu.regs.write(14, SCRATCH + 8);
+    this.cpu.regs.pc = SCRATCH;
+    this.wakeFromSWI();
+  }
+
+  /**
+   * Run a brief ARM routine at the given logical address.
+   * Assumes the CPU is currently suspended (swiPending = true).
+   * The routine should end with SWI sentinelSwiNum.
+   * Resolves when the sentinel SWI fires.
+   * Restores CPU registers on completion.
+   */
+  runArmCallback(routineLogicalAddr: number, sentinelSwiNum: number): Promise<void> {
+    return new Promise((resolve) => {
+      const savedR15 = this.cpu.regs.r15;
+      const savedR0  = this.cpu.regs.read(0);
+      const savedR1  = this.cpu.regs.read(1);
+      const savedR2  = this.cpu.regs.read(2);
+      const savedR3  = this.cpu.regs.read(3);
+
+      this.cpu.swiHandlers.set(sentinelSwiNum, () => {
+        this.cpu.swiHandlers.delete(sentinelSwiNum);
+        // Restore saved registers
+        this.cpu.regs.r15 = savedR15;
+        this.cpu.regs.write(0, savedR0);
+        this.cpu.regs.write(1, savedR1);
+        this.cpu.regs.write(2, savedR2);
+        this.cpu.regs.write(3, savedR3);
+        // Re-suspend CPU — caller will resume normally
+        this.cpu.swiPending = true;
+        resolve();
+      });
+
+      // Set PC to our routine (keep current flags/mode in R15)
+      this.cpu.regs.pc = routineLogicalAddr;
+      // Resume CPU to execute the routine
+      this.wakeFromSWI();
+    });
   }
 
   /** Register a SWI handler by SWI number */
@@ -219,6 +331,7 @@ export class ArchimedesMachine {
    */
   bootROM(): void {
     this.reset();
+    this.logger.debug(`[ROM] size=${this.bus.romSize} bytes`);
     this.running   = true;
     this.paused    = false;
     this.romBooted = true;
@@ -249,22 +362,35 @@ export class ArchimedesMachine {
   private tick(): void {
     if (!this.running || this.paused) return;
 
-    const clockHz  = (this.config.cpuVariant === "ARM3" ? ARM3_CLOCK_HZ : ARM2_CLOCK_HZ)
-                     * this.config.speedMultiplier;
+    const baseClockHz = this.config.cpuVariant === "ARM3" ? ARM3_CLOCK_HZ : ARM2_CLOCK_HZ;
+    const clockHz  = baseClockHz * this.config.speedMultiplier;
     const steps    = this.config.speedMultiplier === 0
       ? STEPS_PER_TICK * 10   // uncapped
       : STEPS_PER_TICK;
 
+    // Sub-batch CPU execution so the IOC timer ticks at the correct rate
+    // relative to the CPU (IOC runs at 2 MHz, ARM2 at 8 MHz → 1 IOC tick per
+    // 4 CPU instructions).  Without sub-batching the timer reads 0 elapsed
+    // inside the ROM's short calibration delay loops, causing an infinite loop.
+    // In uncapped mode (speedMultiplier=0) use the base clock for IOC timing.
+    const iocClockHz = this.config.speedMultiplier === 0 ? baseClockHz : clockHz;
+    const SUB_BATCH = 1000; // instructions between IOC ticks
+    const subUs = Math.floor((SUB_BATCH / iocClockHz) * 1_000_000);
+    let remaining = steps;
     try {
-      this.cpu.step(steps);
+      while (remaining > 0 && !this.cpu.swiPending) {
+        const n = Math.min(SUB_BATCH, remaining);
+        this.cpu.step(n);
+        this.ioc.tick(subUs);
+        remaining -= n;
+      }
     } catch (err) {
       const pc = this.cpu.regs.pc.toString(16).padStart(8, '0');
       this.logger.error(`[CPU crash] PC=0x${pc} — ${err}`);
       this.running = false;
       return;
     }
-    const stepUs = Math.floor((steps / clockHz) * 1_000_000);
-    this.ioc.tick(stepUs);
+    const stepUs = Math.floor(((steps - remaining) / clockHz) * 1_000_000);
 
     // Fire vertical-blank interrupt at ~50 Hz so the ROM task switcher wakes.
     this.vblAccumUs += stepUs;
@@ -273,13 +399,14 @@ export class ArchimedesMachine {
       this.ioc.vblank();
     }
 
-    // MHz measurement
+    // MHz measurement + heartbeat
     const now = Date.now();
     if (now - this.lastMeasure >= 1000) {
       const delta = this.cpu.cycleCount - this.cycleSnapshot;
       this.mhz = parseFloat((delta / 1_000_000).toFixed(2));
       this.cycleSnapshot = this.cpu.cycleCount;
       this.lastMeasure   = now;
+      this.logger.debug(`[CPU] heartbeat mhz=${this.mhz} PC=0x${this.cpu.regs.pc.toString(16).padStart(8,'0')} swiPending=${this.cpu.swiPending}`);
     }
 
     // Keep looping unless a SWI put the CPU into pending state

@@ -12,9 +12,10 @@ import {
 import path from "path";
 import type {
   NativeHost, NativeMenuItem, DrawCommand,
-  WimpWindowDef, WimpIcon, WimpPollEvent,
+  WimpWindowDef, WimpIcon, WimpPollEvent, SpriteData,
 } from "@theprogramminggiantpanda/risc-os";
 import { WimpEvent, WimpMsg, osUnitsToPx } from "@theprogramminggiantpanda/risc-os";
+import { Logger } from "@theprogramminggiantpanda/shared";
 
 const isDev = !require("electron").app.isPackaged;
 
@@ -40,6 +41,9 @@ export class NativeWimpHost implements NativeHost {
   /** Map from RISC OS window handle → BrowserWindow */
   private windows = new Map<number, BrowserWindow>();
 
+  /** Last-known scroll position per window (OS units), for Open events */
+  private windowScroll = new Map<number, { scrollX: number; scrollY: number }>();
+
   /** Pending Wimp_Poll resolvers */
   private pollResolvers: Array<(ev: WimpPollEvent) => void> = [];
   /** Queued events that arrived before Wimp_Poll was called */
@@ -50,9 +54,9 @@ export class NativeWimpHost implements NativeHost {
 
   /** Iconbar BrowserWindow */
   private iconbarWin: BrowserWindow | null = null;
-  private iconbarEntries = new Map<number, { sprite: string; text: string }>();
+  private iconbarEntries = new Map<number, { sprite: string; text: string; spriteData?: SpriteData }>();
 
-  constructor() {
+  constructor(private readonly logger: Logger = new Logger()) {
     this.createIconbar();
     this.listenIPC();
   }
@@ -61,7 +65,8 @@ export class NativeWimpHost implements NativeHost {
   // NativeHost implementation
   // --------------------------------------------------------------------------
 
-  async createWindow(handle: number, def: WimpWindowDef): Promise<string> {
+  createWindow(handle: number, def: WimpWindowDef): void {
+    this.logger.debug(`[NativeWimpHost] createWindow handle=${handle} title="${def.title}"`);
     const rect = osRect(def);
     const win = new BrowserWindow({
       x: rect.x,
@@ -90,53 +95,78 @@ export class NativeWimpHost implements NativeHost {
       this.deliverEvent({ code: WimpEvent.Close, data: [handle, 0, 0, 0, 0, 0, 0, 0] });
     });
 
-    // Track window moves/resizes → update pointer/window state
-    win.on("moved", () => {
-      const [x, y] = win.getPosition();
-      const [w, h] = win.getSize();
-      const disp = screen.getPrimaryDisplay();
-      const H = disp.workAreaSize.height;
-      // Deliver open event so RISC OS knows the new position
+    // Deliver Open_Window_Request + Redraw whenever the native window moves or resizes
+    const deliverGeometryChange = () => {
+      const { x, y, width, height } = win.getContentBounds();
+      const H    = screen.getPrimaryDisplay().workAreaSize.height;
+      const sx   = this.windowScroll.get(handle)?.scrollX ?? 0;
+      const sy   = this.windowScroll.get(handle)?.scrollY ?? 0;
+      const osX0 = x * 2;
+      const osY0 = (H - y - height) * 2;
+      const osX1 = (x + width) * 2;
+      const osY1 = (H - y) * 2;
       this.deliverEvent({
         code: WimpEvent.Open,
-        data: [handle, x * 2, (H - y - h) * 2, (x + w) * 2, (H - y) * 2, 0, 0, -1],
+        data: [handle, osX0, osY0, osX1, osY1, sx, sy, -1],
       });
+      this.deliverEvent({ code: WimpEvent.Redraw, data: [handle] });
+    };
+
+    win.on("moved",  deliverGeometryChange);
+    win.on("resize", () => {
+      win.webContents.send("wimp-resize");
+      deliverGeometryChange();
     });
 
-    win.on("resize", () => win.webContents.send("wimp-resize"));
-
     this.windows.set(handle, win);
-    return `win-${handle}`;
   }
 
-  async openWindow(
+  openWindow(
     handle: number,
-    def: Pick<WimpWindowDef, "visX0"|"visY0"|"visX1"|"visY1"|"scrollX"|"scrollY"|"behind">
-  ): Promise<void> {
+    def: Pick<WimpWindowDef,
+      "visX0"|"visY0"|"visX1"|"visY1"|"scrollX"|"scrollY"|"behind"
+      |"workX0"|"workY0"|"workX1"|"workY1"|"flags">
+  ): void {
     const win = this.windows.get(handle);
+    this.logger.debug(`[NativeWimpHost] openWindow handle=${handle} found=${!!win}`);
     if (!win) return;
+    this.windowScroll.set(handle, { scrollX: def.scrollX, scrollY: def.scrollY });
     const rect = osRect(def);
     win.setBounds(rect);
     win.show();
     win.focus();
-    if (def.behind === -2) win.setAlwaysOnTop(false); // send to back (best effort)
+    if (def.behind === -2) win.setAlwaysOnTop(false);
+
+    win.webContents.send("wimp-workarea", {
+      scrollX:    def.scrollX,
+      scrollY:    def.scrollY,
+      workX0:     def.workX0,
+      workY0:     def.workY0,
+      workX1:     def.workX1,
+      workY1:     def.workY1,
+      hasVScroll: !!(def.flags & (1 << 8)),
+      hasHScroll: !!(def.flags & (1 << 9)),
+    });
   }
 
-  async closeWindow(handle: number): Promise<void> {
+  closeWindow(handle: number): void {
+    this.logger.debug(`[NativeWimpHost] closeWindow handle=${handle}`);
     this.windows.get(handle)?.hide();
   }
 
-  async destroyWindow(handle: number): Promise<void> {
+  destroyWindow(handle: number): void {
+    this.logger.debug(`[NativeWimpHost] destroyWindow handle=${handle}`);
     const win = this.windows.get(handle);
     if (win && !win.isDestroyed()) win.destroy();
     this.windows.delete(handle);
+    this.windowScroll.delete(handle);
   }
 
-  async updateIcon(winHandle: number, iconHandle: number, icon: WimpIcon): Promise<void> {
+  updateIcon(winHandle: number, iconHandle: number, icon: WimpIcon): void {
     this.windows.get(winHandle)?.webContents.send("wimp-update-icon", { iconHandle, icon });
   }
 
-  async draw(winHandle: number, cmds: DrawCommand[]): Promise<void> {
+  draw(winHandle: number, cmds: DrawCommand[]): void {
     this.windows.get(winHandle)?.webContents.send("wimp-draw", cmds);
   }
 
@@ -165,26 +195,27 @@ export class NativeWimpHost implements NativeHost {
     return result.response + 1; // RISC OS: 1=Continue, 2=Cancel
   }
 
-  getPointerInfo() {
-    return this.pointer;
-  }
-
-  pollEvent(mask: number): Promise<WimpPollEvent> {
-    // Check if we have a queued non-masked event
+  tryPollEvent(mask: number): WimpPollEvent | null {
     for (let i = 0; i < this.pendingEvents.length; i++) {
       const ev = this.pendingEvents[i]!;
       if (!((mask >> ev.code) & 1)) {
         this.pendingEvents.splice(i, 1);
-        return Promise.resolve(ev);
+        return ev;
       }
     }
+    return null;
+  }
+
+  pollEvent(mask: number): Promise<WimpPollEvent> {
+    // Check if we have a queued non-masked event
+    const pending = this.tryPollEvent(mask);
+    if (pending) return Promise.resolve(pending);
     // Otherwise wait
     return new Promise((resolve) => {
       this.pollResolvers.push((ev) => {
         if ((mask >> ev.code) & 1) {
-          // Event is masked — re-queue it and try next
+          // Event is masked — re-queue it and deliver null so CPU doesn't block
           this.pendingEvents.push(ev);
-          // Deliver a null event so the CPU doesn't block forever
           resolve({ code: WimpEvent.Null, data: [] });
         } else {
           resolve(ev);
@@ -193,14 +224,35 @@ export class NativeWimpHost implements NativeHost {
     });
   }
 
-  setIconbarEntry(taskHandle: number, sprite: string, text: string): void {
-    this.iconbarEntries.set(taskHandle, { sprite, text });
-    this.iconbarWin?.webContents.send("iconbar-update", [...this.iconbarEntries.entries()]);
+  setIconbarEntry(taskHandle: number, sprite: string, text: string, spriteData?: SpriteData): void {
+    this.logger.debug(`[NativeWimpHost] setIconbarEntry handle=${taskHandle} sprite="${sprite}" text="${text}" hasSprite=${!!spriteData}`);
+    this.iconbarEntries.set(taskHandle, { sprite, text, spriteData });
+    this.sendIconbarUpdate();
   }
 
   removeIconbarEntry(taskHandle: number): void {
     this.iconbarEntries.delete(taskHandle);
-    this.iconbarWin?.webContents.send("iconbar-update", [...this.iconbarEntries.entries()]);
+    this.sendIconbarUpdate();
+  }
+
+  private sendIconbarUpdate(): void {
+    if (!this.iconbarWin || this.iconbarWin.isDestroyed()) {
+      this.logger.debug(`[NativeWimpHost] sendIconbarUpdate: iconbarWin not ready (null=${!this.iconbarWin} destroyed=${this.iconbarWin?.isDestroyed()})`);
+      return;
+    }
+    this.logger.debug(`[NativeWimpHost] sendIconbarUpdate: ${this.iconbarEntries.size} entries`);
+    // Serialise: transfer RGBA as a plain Array so it survives IPC serialisation
+    const payload = [...this.iconbarEntries.entries()].map(([handle, entry]) => [
+      handle,
+      {
+        sprite: entry.sprite,
+        text: entry.text,
+        spriteData: entry.spriteData
+          ? { rgba: Array.from(entry.spriteData.rgba), width: entry.spriteData.width, height: entry.spriteData.height, name: entry.spriteData.name }
+          : undefined,
+      },
+    ]);
+    this.iconbarWin.webContents.send("iconbar-update", payload);
   }
 
   // --------------------------------------------------------------------------
@@ -209,6 +261,7 @@ export class NativeWimpHost implements NativeHost {
 
   /** Deliver an event: wake a waiting Wimp_Poll or queue it */
   deliverEvent(ev: WimpPollEvent): void {
+    this.logger.debug(`[NativeWimpHost] deliverEvent code=${ev.code} data=[${ev.data.slice(0,3).join(',')}] resolvers=${this.pollResolvers.length} pending=${this.pendingEvents.length}`);
     if (this.pollResolvers.length > 0) {
       const resolve = this.pollResolvers.shift()!;
       resolve(ev);
@@ -263,12 +316,13 @@ export class NativeWimpHost implements NativeHost {
     });
     this.iconbarWin.loadURL(rendererURL("iconbar.html"));
     this.iconbarWin.setIgnoreMouseEvents(false);
+    // Resend all entries once the page is ready (fixes race condition)
+    this.iconbarWin.webContents.on("did-finish-load", () => this.sendIconbarUpdate());
   }
 
   private listenIPC(): void {
     // Window renderer → main: user clicked inside a RISC OS window
     ipcMain.on("wimp-click", (_ev, { winHandle, x, y, buttons, iconHandle }) => {
-      const disp = screen.getPrimaryDisplay();
       this.pointer = { x: x * 2, y: y * 2, buttons, winHandle, iconHandle: iconHandle ?? -1 };
       this.deliverEvent({
         code: WimpEvent.Click,
@@ -284,12 +338,33 @@ export class NativeWimpHost implements NativeHost {
       });
     });
 
-    // Iconbar icon clicked → deliver click on handle -2 (iconbar)
+    // Iconbar icon clicked → deliver click on window handle -2 (iconbar)
     ipcMain.on("iconbar-click", (_ev, { taskHandle, buttons }) => {
       this.deliverEvent({
         code: WimpEvent.Click,
         data: [-2, taskHandle, buttons, 0, 0, 0, 0, 0],
       });
+    });
+
+    // User scrolled the native scroll bars → deliver Open_Window_Request + Redraw
+    ipcMain.on("wimp-scroll", (_ev, { winHandle, scrollX, scrollY }: { winHandle: number; scrollX: number; scrollY: number }) => {
+      const win = this.windows.get(winHandle);
+      if (!win || win.isDestroyed()) return;
+
+      this.windowScroll.set(winHandle, { scrollX, scrollY });
+
+      const { x, y, width, height } = win.getContentBounds();
+      const H    = screen.getPrimaryDisplay().workAreaSize.height;
+      const osX0 = x * 2;
+      const osY0 = (H - y - height) * 2;
+      const osX1 = (x + width) * 2;
+      const osY1 = (H - y) * 2;
+
+      this.deliverEvent({
+        code: WimpEvent.Open,
+        data: [winHandle, osX0, osY0, osX1, osY1, scrollX, scrollY, -1],
+      });
+      this.deliverEvent({ code: WimpEvent.Redraw, data: [winHandle] });
     });
 
     // Null poll timer — keep apps alive even when idle

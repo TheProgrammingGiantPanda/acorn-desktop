@@ -9,7 +9,7 @@ export type { ObeyOptions } from "./obey/obey.js";
 export type { FileSystemHost, DirEntry, ObjectType } from "./fs/fs-host.js";
 export { WimpManager } from "./wimp/wimp-manager.js";
 export { WimpEventQueue } from "./wimp/event-queue.js";
-export type { NativeHost, NativeMenuItem, DrawCommand } from "./wimp/native-host.js";
+export type { NativeHost, NativeMenuItem, DrawCommand, SpriteData as IconSpriteData } from "./wimp/native-host.js";
 export {
   WimpEvent, WimpMsg,
   WF_MOVEABLE, WF_HASVSCROLL, WF_HASHSCROLL, WF_CLOSE_ICON, WF_TITLE_BAR, WF_HAS_TITLE,

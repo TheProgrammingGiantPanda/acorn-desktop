@@ -1,9 +1,17 @@
 export {};
 
+import { type SerialisedSprite, renderSpriteToCanvas } from "./sprite-renderer.js";
+
+interface IconbarEntry {
+  sprite: string;
+  text: string;
+  spriteData?: SerialisedSprite;
+}
+
 declare global {
   interface Window {
     iconbar: {
-      onUpdate: (cb: (entries: [number, { sprite: string; text: string }][]) => void) => void;
+      onUpdate: (cb: (entries: [number, IconbarEntry][]) => void) => void;
       click: (taskHandle: number, buttons: number) => void;
     };
   }
@@ -20,16 +28,29 @@ updateClock();
 setInterval(updateClock, 10_000);
 
 window.iconbar.onUpdate((entries) => {
+  console.log(`[iconbar] onUpdate: ${entries.length} entries`, entries.map(([h, e]) => `${h}:${e.sprite}`));
   iconsEl.innerHTML = "";
-  for (const [taskHandle, { sprite, text }] of entries) {
+  for (const [taskHandle, { sprite, text, spriteData }] of entries) {
     const entry = document.createElement("div");
     entry.className = "icon-entry";
-    entry.innerHTML = `
-      <div class="icon-sprite" title="${text}">
-        ${sprite === "application" ? "🖥" : sprite.slice(0, 1).toUpperCase()}
-      </div>
-      <div class="icon-label">${text}</div>
-    `;
+
+    const spriteEl = document.createElement("div");
+    spriteEl.className = "icon-sprite";
+    spriteEl.title = text;
+
+    if (spriteData) {
+      spriteEl.appendChild(renderSpriteToCanvas(spriteData, 34));
+    } else {
+      spriteEl.textContent = sprite.slice(0, 1).toUpperCase();
+    }
+
+    const labelEl = document.createElement("div");
+    labelEl.className = "icon-label";
+    labelEl.textContent = text;
+
+    entry.appendChild(spriteEl);
+    entry.appendChild(labelEl);
+
     entry.addEventListener("click", (e) => {
       const buttons = e.button === 2 ? 2 : (e.button === 1 ? 2 : 4);
       window.iconbar.click(taskHandle, buttons);

@@ -9,10 +9,10 @@ export default defineConfig({
     emptyOutDir: true,
     rollupOptions: {
       input: {
-        index:           path.join(__dirname, "src/renderer/index.html"),
-        window:          path.join(__dirname, "src/renderer/window.html"),
-        iconbar:         path.join(__dirname, "src/renderer/iconbar.html"),
-        programsBrowser: path.join(__dirname, "src/renderer/programs-browser.html"),
+        index:        path.join(__dirname, "src/renderer/index.html"),
+        window:       path.join(__dirname, "src/renderer/window.html"),
+        iconbar:      path.join(__dirname, "src/renderer/iconbar.html"),
+        hostfsBrowser: path.join(__dirname, "src/renderer/hostfs-browser.html"),
       },
     },
   },

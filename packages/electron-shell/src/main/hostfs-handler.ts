@@ -567,4 +567,56 @@ export class HostFsHandler {
     // our handle numbers.  In practice apps use GBPB for bulk I/O so this rarely bites,
     // but single-byte reads/writes to HostFS handles will silently fail until fixed.
   }
+
+  /**
+   * Register private SWI handlers (0x041500–0x041508) that the ARM module
+   * stubs delegate to.  These correspond 1-to-1 with the FS entry points in
+   * the module binary.
+   *
+   * The private SWIs use the same register conventions as the OS SWIs they
+   * wrap, so we can forward directly to the existing handler methods.
+   */
+  registerPrivateSWIs(machine: ArchimedesMachine): void {
+    // 0x041500 – Open (delegates to OS_Find open path)
+    machine.registerSWI(0x041500, (r, b) => this.handleOsFind(r, b));
+    // 0x041501 – GetBytes (delegates to OS_GBPB sequential read, reason 4)
+    machine.registerSWI(0x041501, (r, b) => {
+      // Force reason 4 (sequential read) then delegate
+      const saved = r.read(0);
+      r.write(0, 4);
+      const ret = this.handleOsGBPB(r, b);
+      if (ret === 'passthrough') r.write(0, saved);
+      return ret;
+    });
+    // 0x041502 – PutBytes (delegates to OS_GBPB sequential write, reason 2)
+    machine.registerSWI(0x041502, (r, b) => {
+      const saved = r.read(0);
+      r.write(0, 2);
+      const ret = this.handleOsGBPB(r, b);
+      if (ret === 'passthrough') r.write(0, saved);
+      return ret;
+    });
+    // 0x041503 – Args (delegates to OS_Args)
+    machine.registerSWI(0x041503, (r, b) => this.handleOsArgs(r, b));
+    // 0x041504 – Close (delegates to OS_Find close, reason 0)
+    machine.registerSWI(0x041504, (r, b) => {
+      const saved = r.read(0);
+      r.write(0, 0);
+      const ret = this.handleOsFind(r, b);
+      if (ret === 'passthrough') r.write(0, saved);
+      return ret;
+    });
+    // 0x041505 – File (delegates to OS_File)
+    machine.registerSWI(0x041505, (r, b) => this.handleOsFile(r, b));
+    // 0x041506 – Enumerate (delegates to OS_GBPB, reason 9)
+    machine.registerSWI(0x041506, (r, b) => {
+      const saved = r.read(0);
+      r.write(0, 9);
+      const ret = this.handleOsGBPB(r, b);
+      if (ret === 'passthrough') r.write(0, saved);
+      return ret;
+    });
+    // 0x041507 – GBPB (delegates to OS_GBPB passthrough)
+    machine.registerSWI(0x041507, (r, b) => this.handleOsGBPB(r, b));
+  }
 }

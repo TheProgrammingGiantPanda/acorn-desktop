@@ -7,6 +7,7 @@
  * Commands handled:
  *   Set / SetMacro / Unset     — system variable management
  *   Run <path>                 — run an Obey file or ARM binary
+ *   /path                      — shorthand for Run path
  *   RMLoad <path>              — load a relocatable module (stub)
  *   RMEnsure <n> <v> [<cmd>]  — ensure module version present (stub)
  *   WimpSlot [-min n] [-max n] — set Wimp slot size (stub)
@@ -15,6 +16,10 @@
  *   Echo <text>                — print text
  *   IconSprites <path>         — load app sprites into the sprite pool
  *   | <comment>                — ignored
+ *
+ * This interpreter is used only for pre-boot !Boot scripts (bootAllApps).
+ * In ROM boot mode, app launching goes through the ROM's own CLI handler
+ * (machine.execCLI) which handles *FX, *IfThere, *RMLoad, etc. natively.
  */
 
 import type { FileSystemHost } from '../fs/fs-host.js';
@@ -100,8 +105,13 @@ export class ObeyInterpreter {
       case 'ECHO':        this.output(rest.trim() + '\r\n'); break;
       case 'ICONSPRITES': this.cmdIconSprites(rest.trim()); break;
       default:
-        // Bare path or unrecognised command: treat as Run
-        this.cmdRun(line);
+        // '/path' is RISC OS shorthand for 'Run path'
+        if (line.startsWith('/')) {
+          this.cmdRun(line.slice(1).trim());
+        } else {
+          // Bare path or unrecognised command: treat as Run
+          this.cmdRun(line);
+        }
         break;
     }
   }
@@ -119,7 +129,7 @@ export class ObeyInterpreter {
     // Strip any trailing arguments (e.g. "%*0" Obey parameter substitution).
     // RISC OS paths never contain spaces, so the first whitespace-delimited
     // token is always the file path.
-    path = path.split(/\s+/)[0] ?? '';
+    path = this.resolvePathVar(path.split(/\s+/)[0] ?? '');
     if (!path) return;
 
     if (!this.fs) {
